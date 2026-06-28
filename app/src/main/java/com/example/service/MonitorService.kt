@@ -145,17 +145,17 @@ class MonitorService : Service() {
             repository.updateChannel(updatedChannel)
 
             // Real live status check
-            val liveInfo = checkLiveStream(channel.handle)
+            val liveInfo = checkLiveStream(updatedChannel.handle)
             if (liveInfo != null) {
                 // Channel is LIVE! Start a real HLS recording
                 val activeRecordings = repository.allRecordings.first()
-                val isAlreadyRecording = activeRecordings.any { it.channelId == channel.id && it.status == "RECORDING" }
+                val isAlreadyRecording = activeRecordings.any { it.channelId == updatedChannel.id && it.status == "RECORDING" }
                 if (!isAlreadyRecording) {
-                    repository.logInfo("Channel ${channel.name} is LIVE!")
-                    triggerRecording(channel, liveInfo.title, liveInfo.hlsManifestUrl, liveInfo.videoId)
+                    repository.logInfo("Channel ${updatedChannel.name} is LIVE!")
+                    triggerRecording(updatedChannel, liveInfo.title, liveInfo.hlsManifestUrl, liveInfo.videoId)
                 }
             } else {
-                repository.logInfo("Channel ${channel.name} (${channel.handle}) status checked: OFFLINE")
+                repository.logInfo("Channel ${updatedChannel.name} (${updatedChannel.handle}) status checked: OFFLINE")
             }
         }
     }
@@ -360,6 +360,7 @@ class MonitorService : Service() {
         val cleanHandle = if (handle.startsWith("@")) handle else "@$handle"
         val url = "https://www.youtube.com/$cleanHandle/live"
         try {
+            repository.logInfo("Checking live status for channel: $cleanHandle via $url")
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -372,6 +373,7 @@ class MonitorService : Service() {
                         finalUrl = response.request.url.toString()
                         response.body?.string()
                     } else {
+                        repository.logWarn("HTTP request failed for $cleanHandle. Code: ${response.code}")
                         null
                     }
                 }
@@ -379,7 +381,9 @@ class MonitorService : Service() {
             
             var isLive = false
             var videoId = ""
-            
+            var title = "Live Stream"
+            var hlsManifestUrl = ""
+
             // 1. Check if the final URL itself got redirected to watch?v= or /live/ (with a trailing slash + ID)
             if (finalUrl.contains("/watch?v=") || (finalUrl.contains("/live/") && !finalUrl.endsWith("/live") && !finalUrl.endsWith("/live/"))) {
                 isLive = true
@@ -388,6 +392,7 @@ class MonitorService : Service() {
                 } else {
                     finalUrl.substringAfter("/live/").substringBefore("?")
                 }
+                repository.logInfo("Detected live redirection: finalUrl=$finalUrl, videoId=$videoId")
             }
             
             // 2. Check canonical or og:url in HTML
@@ -406,13 +411,42 @@ class MonitorService : Service() {
                     } else {
                         targetUrl.substringAfter("/live/").substringBefore("?")
                     }
+                    repository.logInfo("Detected live URL from meta og/canonical: targetUrl=$targetUrl, videoId=$videoId")
                 }
             }
             
-            // 3. Check ytInitialPlayerResponse JSON
-            var title = "Live Stream"
-            var hlsManifestUrl = ""
+            // 3. Check for specific live indicators and fallback videoId on page source
+            if (!isLive) {
+                val hasLiveMarker = responseText.contains("hlsManifestUrl") || 
+                        responseText.contains("\"isLive\":true") || 
+                        responseText.contains("\"isLive\": true") || 
+                        responseText.contains("\"isLiveStream\":true") || 
+                        responseText.contains("\"isLiveStream\": true") ||
+                        responseText.contains("LIVE_STREAM_OFFLINE") ||
+                        responseText.contains("Started streaming") ||
+                        responseText.contains("watching now")
+                
+                if (hasLiveMarker) {
+                    val videoIdRegex = """"videoId"\s*:\s*"([^"]+)"""".toRegex()
+                    val videoIdMatch = videoIdRegex.find(responseText)
+                    if (videoIdMatch != null) {
+                        isLive = true
+                        videoId = videoIdMatch.groupValues[1]
+                        repository.logInfo("Detected live via page markers. videoId=$videoId")
+                    } else {
+                        // Look inside og:image thumb URL if videoId field not found
+                        val ogImageRegex = """<meta\s+property="og:image"\s+content="[^"]+/vi/([^/]+)/[^"]+"""".toRegex(RegexOption.IGNORE_CASE)
+                        val ogImageMatch = ogImageRegex.find(responseText)
+                        if (ogImageMatch != null) {
+                            isLive = true
+                            videoId = ogImageMatch.groupValues[1]
+                            repository.logInfo("Detected live via og:image fallback. videoId=$videoId")
+                        }
+                    }
+                }
+            }
             
+            // 4. Check ytInitialPlayerResponse JSON if present
             val playerResponse = extractInitialPlayerResponse(responseText)
             if (playerResponse != null) {
                 val videoDetails = playerResponse.optJSONObject("videoDetails")
@@ -428,20 +462,6 @@ class MonitorService : Service() {
                 
                 val streamingData = playerResponse.optJSONObject("streamingData")
                 hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
-            }
-            
-            // 4. Fallback: Search for isLive, videoId, and title using regex in HTML
-            if (!isLive) {
-                val videoIdRegex = """"videoId"\s*:\s*"([^"]+)"""".toRegex()
-                val isLiveRegex = """"isLive"\s*:\s*true""".toRegex()
-                
-                val videoIdMatch = videoIdRegex.find(responseText)
-                val hasIsLive = isLiveRegex.containsMatchIn(responseText) || responseText.contains("\"isLiveStream\":true")
-                
-                if (hasIsLive && videoIdMatch != null) {
-                    isLive = true
-                    videoId = videoIdMatch.groupValues[1]
-                }
             }
             
             if (isLive && videoId.isNotEmpty()) {
@@ -470,9 +490,13 @@ class MonitorService : Service() {
                     }
                 }
                 
+                repository.logInfo("Channel $cleanHandle IS LIVE! Video ID: $videoId, Title: '$title'")
                 return LiveInfo(videoId, title, hlsManifestUrl)
+            } else {
+                repository.logInfo("Channel $cleanHandle checked: OFFLINE")
             }
         } catch (e: Exception) {
+            repository.logError("Error checking live status for $handle: ${e.message}")
             e.printStackTrace()
         }
         return null
@@ -643,6 +667,7 @@ class MonitorService : Service() {
             request.addOption("-o", outputFile.absolutePath)
             
             // Replicate the highly successful Termux command-line options exactly
+            request.addOption("--extractor-args", "youtube:player-client=android_vr")
             request.addOption("--js-runtime", "quickjs")
             request.addOption("--wait-for-video", "60")
             request.addOption("--live-from-start")
