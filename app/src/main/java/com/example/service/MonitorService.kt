@@ -67,6 +67,9 @@ class MonitorService : Service() {
         // Start background polling and checking
         startChannelPolling()
         
+        // Automatically check for yt-dlp binary updates on startup
+        updateYtDlpEngine()
+        
         scope.launch {
             repository.logInfo("Live Monitor Service started.")
             repository.logInfo("WAKELOCK requested: PARTIAL_WAKE_LOCK held to prevent sleep.")
@@ -108,6 +111,10 @@ class MonitorService : Service() {
                     if (url.isNotEmpty()) {
                         startCompletedStreamDownload(url, title)
                     }
+                }
+                ACTION_UPDATE_ENGINE -> {
+                    repository.logInfo("Manual yt-dlp update triggered.")
+                    updateYtDlpEngine()
                 }
             }
         }
@@ -159,8 +166,8 @@ class MonitorService : Service() {
         val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.mp4"
         val outputFile = File(storageFolder, fileName)
 
-        if (manifestUrl.isBlank() && !videoId.startsWith("fake_")) {
-            // Live detected and manifest is blank, use our integrated yt-dlp recorder!
+        if (!videoId.startsWith("fake_")) {
+            // Live detected, use our integrated yt-dlp recorder!
             val recording = RecordingItem(
                 channelId = channel.id,
                 channelName = channel.name,
@@ -625,8 +632,8 @@ class MonitorService : Service() {
         try {
             repository.logInfo("Initializing yt-dlp recorder for recording $recordingId...")
             try {
-                com.yausername.youtubedl_android.YoutubeDL.init(this)
-                com.yausername.ffmpeg.FFmpeg.init(this)
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(this)
+                com.yausername.ffmpeg.FFmpeg.getInstance().init(this)
             } catch (e: Exception) {
                 repository.logError("yt-dlp init error: ${e.message}")
             }
@@ -634,7 +641,24 @@ class MonitorService : Service() {
             val request = com.yausername.youtubedl_android.YoutubeDLRequest(videoUrl)
             request.addOption("--no-mtime")
             request.addOption("-o", outputFile.absolutePath)
-            request.addOption("-f", "best") // select best quality stream
+            
+            // Replicate the highly successful Termux command-line options exactly
+            request.addOption("--js-runtime", "quickjs")
+            request.addOption("--wait-for-video", "60")
+            request.addOption("--live-from-start")
+            request.addOption("--hls-use-mpegts")
+            request.addOption("--no-part")
+            request.addOption("--skip-unavailable-fragments")
+            request.addOption("--retries", "10")
+            request.addOption("--fragment-retries", "infinite")
+            request.addOption("--extractor-retries", "infinite")
+            request.addOption("--file-access-retries", "infinite")
+            request.addOption("--retry-sleep", "5")
+            request.addOption("--socket-timeout", "10")
+            request.addOption("--force-ipv4")
+            request.addOption("--no-check-certificates")
+            request.addOption("-f", "bv*[height<=480]+ba/b/best")
+            request.addOption("--merge-output-format", "mp4")
 
             val recording = repository.getRecordingById(recordingId)
             if (recording != null) {
@@ -652,7 +676,7 @@ class MonitorService : Service() {
             
             // Execute in background
             val response = withContext(Dispatchers.IO) {
-                com.yausername.youtubedl_android.YoutubeDL.execute(request, object : com.yausername.youtubedl_android.DownloadProgressCallback {
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().execute(request, object : com.yausername.youtubedl_android.DownloadProgressCallback {
                     override fun onProgressUpdate(progress: Float, etaInSeconds: Long, line: String) {
                         // Periodic update
                         scope.launch {
@@ -686,15 +710,17 @@ class MonitorService : Service() {
                     repository.logInfo("yt-dlp download completed for recording: '${rec.streamTitle}'")
                     updateNotification("Live Monitor", "Recording of '${rec.streamTitle}' completed.")
                 } else {
-                    repository.updateRecording(rec.copy(status = "CANCELLED"))
+                    val errMsg = "yt-dlp exited with code ${response.exitCode}. Error: ${response.err ?: "Unknown error"}"
+                    repository.updateRecording(rec.copy(status = "CANCELLED", errorMessage = errMsg))
                     repository.logError("yt-dlp exited with non-zero code ${response.exitCode}. Error output: ${response.err}")
                 }
             }
         } catch (e: Exception) {
+            val errMsg = "yt-dlp failed: ${e.message}"
             repository.logError("yt-dlp download failed: ${e.message}")
             val rec = repository.getRecordingById(recordingId)
             if (rec != null) {
-                repository.updateRecording(rec.copy(status = "CANCELLED"))
+                repository.updateRecording(rec.copy(status = "CANCELLED", errorMessage = errMsg))
             }
         } finally {
             activeDownloadJobs.remove(recordingId)
@@ -865,6 +891,19 @@ class MonitorService : Service() {
         }
     }
 
+    private fun updateYtDlpEngine() {
+        scope.launch(Dispatchers.IO) {
+            repository.logWarn("Checking for yt-dlp engine updates...")
+            try {
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(this@MonitorService)
+                val status = com.yausername.youtubedl_android.YoutubeDL.getInstance().updateYoutubeDL(this@MonitorService)
+                repository.logInfo("yt-dlp engine update completed: $status")
+            } catch (e: Exception) {
+                repository.logError("yt-dlp engine update failed: ${e.message}")
+            }
+        }
+    }
+
     private fun buildNotification(title: String, content: String): Notification {
         val notificationIntent = Intent(this, MainActivity::class.java)
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -897,6 +936,7 @@ class MonitorService : Service() {
         const val ACTION_SIMULATE_STREAM = "com.example.service.action.SIMULATE_STREAM"
         const val ACTION_RESTORE_NETWORK = "com.example.service.action.RESTORE_NETWORK"
         const val ACTION_DOWNLOAD_URL = "com.example.service.action.DOWNLOAD_URL"
+        const val ACTION_UPDATE_ENGINE = "com.example.service.action.UPDATE_ENGINE"
     }
 }
 

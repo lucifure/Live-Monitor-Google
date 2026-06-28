@@ -71,7 +71,7 @@ interface LogDao {
 
 @Database(
     entities = [MonitoredChannel::class, RecordingItem::class, SystemLog::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

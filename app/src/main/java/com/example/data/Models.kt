@@ -28,7 +28,8 @@ data class RecordingItem(
     val filePath: String = "",
     val playerClient: String = "android_vr", // fallback order: android_vr, tv, web, mweb, ios, tv_embedded, ffmpeg
     val timestamp: Long = System.currentTimeMillis(),
-    val urlType: String = "LIVE" // "LIVE" or "COMPLETED"
+    val urlType: String = "LIVE", // "LIVE" or "COMPLETED"
+    val errorMessage: String? = null
 )
 
 @Entity(tableName = "system_logs")

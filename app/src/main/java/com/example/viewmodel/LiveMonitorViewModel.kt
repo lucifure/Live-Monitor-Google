@@ -223,6 +223,13 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
         getApplication<Application>().startService(intent)
     }
 
+    fun updateYtDlpEngine() {
+        val intent = Intent(getApplication(), MonitorService::class.java).apply {
+            action = MonitorService.ACTION_UPDATE_ENGINE
+        }
+        getApplication<Application>().startService(intent)
+    }
+
     fun clearLogs() {
         viewModelScope.launch {
             repository.clearLogs()
