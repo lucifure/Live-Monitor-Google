@@ -656,10 +656,12 @@ class MonitorService : Service() {
         try {
             repository.logInfo("Initializing yt-dlp recorder for recording $recordingId...")
             try {
-                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(this)
-                com.yausername.ffmpeg.FFmpeg.getInstance().init(this)
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
             } catch (e: Exception) {
-                repository.logError("yt-dlp init error: ${e.message}")
+                val detailedError = "yt-dlp init error: ${e.message}. Cause: ${e.cause?.message}. Stack: ${android.util.Log.getStackTraceString(e)}"
+                repository.logError(detailedError)
+                android.util.Log.e("MonitorService", detailedError, e)
             }
 
             val request = com.yausername.youtubedl_android.YoutubeDLRequest(videoUrl)
@@ -920,11 +922,13 @@ class MonitorService : Service() {
         scope.launch(Dispatchers.IO) {
             repository.logWarn("Checking for yt-dlp engine updates...")
             try {
-                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(this@MonitorService)
-                val status = com.yausername.youtubedl_android.YoutubeDL.getInstance().updateYoutubeDL(this@MonitorService)
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                val status = com.yausername.youtubedl_android.YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
                 repository.logInfo("yt-dlp engine update completed: $status")
             } catch (e: Exception) {
-                repository.logError("yt-dlp engine update failed: ${e.message}")
+                val detailedError = "yt-dlp engine update failed: ${e.message}. Cause: ${e.cause?.message}. Stack: ${android.util.Log.getStackTraceString(e)}"
+                repository.logError(detailedError)
+                android.util.Log.e("MonitorService", detailedError, e)
             }
         }
     }

@@ -21,6 +21,15 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    ndk {
+      abiFilters.addAll(setOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+    }
+  }
+
+  packaging {
+    jniLibs {
+      pickFirsts.addAll(setOf("**/lib*.so", "**/libc++_shared.so"))
+    }
   }
 
   signingConfigs {
@@ -129,6 +138,6 @@ dependencies {
   "ksp"(libs.moshi.kotlin.codegen)
   
   // Real yt-dlp recorder backend (yausername's Jitpack artifacts)
-  implementation("com.github.yausername.youtubedl-android:library:0.14.0")
-  implementation("com.github.yausername.youtubedl-android:ffmpeg:0.14.0")
+  implementation("com.github.yausername.youtubedl-android:library:0.18.1")
+  implementation("com.github.yausername.youtubedl-android:ffmpeg:0.18.1")
 }
