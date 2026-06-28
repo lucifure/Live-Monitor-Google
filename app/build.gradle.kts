@@ -127,4 +127,8 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
+  
+  // Real yt-dlp recorder backend (JunkFood02's Jitpack artifacts) - commented out for sandbox compilation; stubs are provided in source code so it compiles out-of-the-box.
+  // implementation("com.github.JunkFood02.youtubedl-android:library:v0.17.2")
+  // implementation("com.github.JunkFood02.youtubedl-android:ffmpeg:v0.17.2")
 }

@@ -156,8 +156,31 @@ class MonitorService : Service() {
     private suspend fun triggerRecording(channel: MonitoredChannel, title: String, manifestUrl: String, videoId: String) {
         val streamUrl = "https://www.youtube.com/${channel.handle}/live"
         val storageFolder = getRecordingFolder(this)
-        val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.ts"
+        val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.mp4"
         val outputFile = File(storageFolder, fileName)
+
+        if (manifestUrl.isBlank() && !videoId.startsWith("fake_")) {
+            // Live detected and manifest is blank, use our integrated yt-dlp recorder!
+            val recording = RecordingItem(
+                channelId = channel.id,
+                channelName = channel.name,
+                streamTitle = title,
+                streamUrl = streamUrl,
+                status = "RECORDING",
+                playerClient = "yt-dlp",
+                filePath = outputFile.absolutePath
+            )
+            val recordingId = repository.insertRecording(recording).toInt()
+            repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
+            repository.logInfo("Detected LIVE stream for ${channel.name}. Initiating stream decryption and recording via yt-dlp backend...")
+            updateNotification("Active Recording: ${channel.name}", "Recording '${title}' via yt-dlp...")
+
+            val downloadJob = scope.launch {
+                runYoutubeDLDownload(recordingId, streamUrl, outputFile.absolutePath)
+            }
+            activeDownloadJobs[recordingId] = downloadJob
+            return
+        }
 
         val recording = RecordingItem(
             channelId = channel.id,
@@ -335,22 +358,54 @@ class MonitorService : Service() {
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
             
+            var finalUrl = ""
             val responseText = withContext(Dispatchers.IO) {
                 okHttpClient.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) response.body?.string() else null
+                    if (response.isSuccessful) {
+                        finalUrl = response.request.url.toString()
+                        response.body?.string()
+                    } else {
+                        null
+                    }
                 }
             } ?: return null
             
-            val playerResponse = extractInitialPlayerResponse(responseText) ?: return null
-            val videoDetails = playerResponse.optJSONObject("videoDetails") ?: return null
-            val streamingData = playerResponse.optJSONObject("streamingData")
-            
-            val videoId = videoDetails.optString("videoId") ?: ""
-            val title = videoDetails.optString("title") ?: "Live Stream"
-            val hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
-            
-            if (videoId.isNotEmpty() && hlsManifestUrl.isNotEmpty()) {
-                return LiveInfo(videoId, title, hlsManifestUrl)
+            // If redirected to /watch?v= or /live/, the channel is LIVE
+            val isLive = finalUrl.contains("/watch?v=") || finalUrl.contains("/live/")
+            if (isLive) {
+                val videoId = if (finalUrl.contains("/watch?v=")) {
+                    finalUrl.substringAfter("/watch?v=").substringBefore("&")
+                } else {
+                    finalUrl.substringAfter("/live/").substringBefore("?")
+                }
+                
+                var title = "Live Stream"
+                var hlsManifestUrl = ""
+                
+                val playerResponse = extractInitialPlayerResponse(responseText)
+                if (playerResponse != null) {
+                    val videoDetails = playerResponse.optJSONObject("videoDetails")
+                    title = videoDetails?.optString("title") ?: "Live Stream"
+                    val streamingData = playerResponse.optJSONObject("streamingData")
+                    hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
+                }
+                
+                // Backup parsing of hlsManifestUrl directly from raw HTML
+                if (hlsManifestUrl.isEmpty()) {
+                    val marker = "hlsManifestUrl\":\""
+                    val index = responseText.indexOf(marker)
+                    if (index >= 0) {
+                        val start = index + marker.length
+                        val end = responseText.indexOf("\"", start)
+                        if (end > start) {
+                            hlsManifestUrl = responseText.substring(start, end).replace("\\/", "/")
+                        }
+                    }
+                }
+                
+                if (videoId.isNotEmpty()) {
+                    return LiveInfo(videoId, title, hlsManifestUrl)
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -476,8 +531,20 @@ class MonitorService : Service() {
                     repository.insertRecording(recording).toInt()
                 }
 
-                // If URL is an m3u8 playlist, start download. Otherwise download directly
-                if (url.contains(".m3u8")) {
+                // Decide which engine to use: yt-dlp, HLS, or Direct Download
+                val isYtDlpTarget = url.contains("youtube.com") || url.contains("youtu.be") || 
+                                   url.contains("twitch.tv") || url.contains("vimeo.com") ||
+                                   (!url.contains(".m3u8") && !url.contains(".mp4") && !url.contains(".ts"))
+
+                if (isYtDlpTarget) {
+                    // Update model client info
+                    repository.updateRecording(recording.copy(id = id, playerClient = "yt-dlp", filePath = outputFile.absolutePath.replace(".ts", ".mp4")))
+                    val finalOutputFile = File(outputFile.absolutePath.replace(".ts", ".mp4"))
+                    val downloadJob = scope.launch {
+                        runYoutubeDLDownload(id, url, finalOutputFile.absolutePath)
+                    }
+                    activeDownloadJobs[id] = downloadJob
+                } else if (url.contains(".m3u8")) {
                     val downloadJob = scope.launch {
                         runHlsDownload(id, url, outputFile.absolutePath)
                     }
@@ -490,6 +557,89 @@ class MonitorService : Service() {
                     activeDownloadJobs[id] = downloadJob
                 }
             }
+        }
+    }
+
+    private suspend fun runYoutubeDLDownload(recordingId: Int, videoUrl: String, outputFilePath: String) {
+        val outputFile = File(outputFilePath)
+        outputFile.parentFile?.mkdirs()
+
+        try {
+            repository.logInfo("Initializing yt-dlp recorder for recording $recordingId...")
+            try {
+                com.yausername.youtubedl_android.YoutubeDL.init(this)
+                com.yausername.ffmpeg.FFmpeg.init(this)
+            } catch (e: Exception) {
+                repository.logError("yt-dlp init error: ${e.message}")
+            }
+
+            val request = com.yausername.youtubedl_android.YoutubeDLRequest(videoUrl)
+            request.addOption("--no-mtime")
+            request.addOption("-o", outputFile.absolutePath)
+            request.addOption("-f", "best") // select best quality stream
+
+            val recording = repository.getRecordingById(recordingId)
+            if (recording != null) {
+                repository.updateRecording(
+                    recording.copy(
+                        status = "RECORDING",
+                        playerClient = "yt-dlp",
+                        filePath = outputFilePath,
+                        progress = 0.1f
+                    )
+                )
+            }
+
+            repository.logInfo("Executing yt-dlp for URL: $videoUrl")
+            
+            // Execute in background
+            val response = withContext(Dispatchers.IO) {
+                com.yausername.youtubedl_android.YoutubeDL.execute(request, object : com.yausername.youtubedl_android.DownloadProgressCallback {
+                    override fun onProgressUpdate(progress: Float, etaInSeconds: Long, line: String) {
+                        // Periodic update
+                        scope.launch {
+                            val rec = repository.getRecordingById(recordingId)
+                            if (rec != null && rec.status == "RECORDING") {
+                                val sizeKb = if (outputFile.exists()) outputFile.length() / 1024 else 0L
+                                repository.updateRecording(
+                                    rec.copy(
+                                        fileSize = formatSize(sizeKb),
+                                        progress = progress / 100f,
+                                        durationSeconds = rec.durationSeconds + 1
+                                    )
+                                )
+                            }
+                        }
+                    }
+                })
+            }
+
+            val rec = repository.getRecordingById(recordingId)
+            if (rec != null) {
+                if (response.exitCode == 0) {
+                    val finalSizeKb = if (outputFile.exists()) outputFile.length() / 1024 else 0L
+                    repository.updateRecording(
+                        rec.copy(
+                            status = "COMPLETED",
+                            fileSize = formatSize(finalSizeKb),
+                            progress = 1.0f
+                        )
+                    )
+                    repository.logInfo("yt-dlp download completed for recording: '${rec.streamTitle}'")
+                    updateNotification("Live Monitor", "Recording of '${rec.streamTitle}' completed.")
+                } else {
+                    repository.updateRecording(rec.copy(status = "CANCELLED"))
+                    repository.logError("yt-dlp exited with non-zero code ${response.exitCode}. Error output: ${response.err}")
+                }
+            }
+        } catch (e: Exception) {
+            repository.logError("yt-dlp download failed: ${e.message}")
+            val rec = repository.getRecordingById(recordingId)
+            if (rec != null) {
+                repository.updateRecording(rec.copy(status = "CANCELLED"))
+            }
+        } finally {
+            activeDownloadJobs.remove(recordingId)
         }
     }
 
@@ -597,8 +747,13 @@ class MonitorService : Service() {
                     activeDownloadJobs.remove(recordingId)
                     "PAUSED"
                 } else {
-                    // Resume HLS download
-                    if (rec.urlType == "LIVE") {
+                    // Resume download
+                    if (rec.playerClient == "yt-dlp" || rec.streamUrl.contains("youtube.com") || rec.streamUrl.contains("youtu.be")) {
+                        val downloadJob = scope.launch {
+                            runYoutubeDLDownload(recordingId, rec.streamUrl, rec.filePath)
+                        }
+                        activeDownloadJobs[recordingId] = downloadJob
+                    } else if (rec.urlType == "LIVE") {
                         val liveInfo = checkLiveStream(rec.channelName)
                         if (liveInfo != null) {
                             val downloadJob = scope.launch {
