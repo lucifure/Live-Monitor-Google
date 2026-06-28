@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -73,24 +74,23 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
 
         // Insert default channel if empty
         viewModelScope.launch {
-            repository.allChannels.collect { list ->
-                if (list.isEmpty()) {
-                    // Seed standard channels
-                    repository.insertChannel(
-                        MonitoredChannel(
-                            name = "Darth MB (Retro Live)",
-                            handle = "@darth_mb",
-                            status = "MONITORING"
-                        )
+            val list = repository.allChannels.first()
+            if (list.isEmpty()) {
+                // Seed standard channels
+                repository.insertChannel(
+                    MonitoredChannel(
+                        name = "Darth MB (Retro Live)",
+                        handle = "@darth_mb",
+                        status = "MONITORING"
                     )
-                    repository.insertChannel(
-                        MonitoredChannel(
-                            name = "Lofi Girl Live",
-                            handle = "@lofigirl",
-                            status = "PAUSED"
-                        )
+                )
+                repository.insertChannel(
+                    MonitoredChannel(
+                        name = "Lofi Girl Live",
+                        handle = "@lofigirl",
+                        status = "PAUSED"
                     )
-                }
+                )
             }
         }
     }

@@ -16,17 +16,19 @@ import com.example.data.AppDatabase
 import com.example.data.LiveMonitorRepository
 import com.example.data.MonitoredChannel
 import com.example.data.RecordingItem
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.isActive
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
 import java.io.File
-import kotlin.random.Random
+import java.io.FileOutputStream
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 class MonitorService : Service() {
 
@@ -38,6 +40,13 @@ class MonitorService : Service() {
     val isServiceRunning: StateFlow<Boolean> = _isServiceRunning
 
     private val binder = LocalBinder()
+    
+    private val okHttpClient = OkHttpClient.Builder()
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    private val activeDownloadJobs = ConcurrentHashMap<Int, Job>()
 
     inner class LocalBinder : Binder() {
         fun getService(): MonitorService = this@MonitorService
@@ -55,14 +64,13 @@ class MonitorService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."))
         
-        // Start background polling and progress loop
+        // Start background polling and checking
         startChannelPolling()
-        startProgressTracker()
         
         scope.launch {
             repository.logInfo("Live Monitor Service started.")
             repository.logInfo("WAKELOCK requested: PARTIAL_WAKE_LOCK held to prevent sleep.")
-            repository.logInfo("Keep-alive scheduled: Firing network ping to Youtube every 5 mins.")
+            repository.logInfo("Keep-alive scheduled: Firing network check every 5 mins.")
         }
     }
 
@@ -107,9 +115,9 @@ class MonitorService : Service() {
 
     private fun startChannelPolling() {
         scope.launch {
-            while (true) {
+            while (isActive) {
                 pollChannelsOnce()
-                delay(60000) // 60 seconds
+                delay(60000) // Poll every 60 seconds
             }
         }
     }
@@ -129,14 +137,15 @@ class MonitorService : Service() {
             val updatedChannel = channel.copy(lastChecked = System.currentTimeMillis())
             repository.updateChannel(updatedChannel)
 
-            // Randomly simulate going live for `@darth_mb` or other channels (e.g. 10% chance per poll)
-            if (Random.nextInt(100) < 15) {
-                // Check if already recording
+            // Real live status check
+            val liveInfo = checkLiveStream(channel.handle)
+            if (liveInfo != null) {
+                // Channel is LIVE! Start a real HLS recording
                 val activeRecordings = repository.allRecordings.first()
                 val isAlreadyRecording = activeRecordings.any { it.channelId == channel.id && it.status == "RECORDING" }
                 if (!isAlreadyRecording) {
                     repository.logInfo("Channel ${channel.name} is LIVE!")
-                    triggerRecording(channel, "Live Stream - " + getStreamNamePlaceholder())
+                    triggerRecording(channel, liveInfo.title, liveInfo.hlsManifestUrl, liveInfo.videoId)
                 }
             } else {
                 repository.logInfo("Channel ${channel.name} (${channel.handle}) status checked: OFFLINE")
@@ -144,120 +153,307 @@ class MonitorService : Service() {
         }
     }
 
-    private fun getStreamNamePlaceholder(): String {
-        val streams = listOf(
-            "Retro Gaming Session & Chat",
-            "Overnight Chill Lo-Fi Radio",
-            "Weekend Stream: Coding Live Monitor App",
-            "Community Q&A and Tech Talk",
-            "Developing Fallback pipelines in Android"
+    private suspend fun triggerRecording(channel: MonitoredChannel, title: String, manifestUrl: String, videoId: String) {
+        val streamUrl = "https://www.youtube.com/${channel.handle}/live"
+        val storageFolder = getRecordingFolder(this)
+        val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.ts"
+        val outputFile = File(storageFolder, fileName)
+
+        val recording = RecordingItem(
+            channelId = channel.id,
+            channelName = channel.name,
+            streamTitle = title,
+            streamUrl = streamUrl,
+            status = "RECORDING",
+            playerClient = "hls_downloader",
+            filePath = outputFile.absolutePath
         )
-        return streams[Random.nextInt(streams.size)]
+        val recordingId = repository.insertRecording(recording).toInt()
+        
+        // Update channel
+        repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
+        updateNotification("Active Recording: ${channel.name}", "Recording '${title}'...")
+
+        // Launch HLS Download Job
+        val downloadJob = scope.launch {
+            runHlsDownload(recordingId, manifestUrl, outputFile.absolutePath)
+        }
+        activeDownloadJobs[recordingId] = downloadJob
     }
 
-    private suspend fun triggerRecording(channel: MonitoredChannel, title: String) {
-        val streamUrl = "https://www.youtube.com/${channel.handle}/live"
-        
-        // Define fallback sequence and start recording
-        val fallbackClients = listOf("android_vr", "tv", "web", "mweb", "ios", "tv_embedded", "ffmpeg (HLS)")
-        
-        scope.launch {
-            var clientIndex = 0
-            var success = false
-            var activeClient = fallbackClients[0]
+    private suspend fun runHlsDownload(recordingId: Int, manifestUrl: String, outputFilePath: String) {
+        val client = okHttpClient
+        val outputFile = File(outputFilePath)
+        outputFile.parentFile?.mkdirs()
 
-            // Simulate the client fallback sequence
-            while (clientIndex < fallbackClients.size && !success) {
-                activeClient = fallbackClients[clientIndex]
-                repository.logInfo("yt-dlp: Attempting connection to stream with player client '$activeClient'...")
+        val downloadedSegments = ConcurrentHashMap.newKeySet<String>()
+        var totalBytes = 0L
+        var totalSeconds = 0L
+
+        try {
+            FileOutputStream(outputFile, true).use { outputStream ->
+                var consecutiveFailures = 0
                 
-                // Let's pretend some connection attempts fail to show the fallback chain beautifully
-                // android_vr fails 50% of the time, tv fails 50% etc., to demonstrate the fallback order!
-                delay(1200)
-                if (clientIndex < 3 && Random.nextBoolean()) {
-                    repository.logWarn("yt-dlp error: client '$activeClient' failed. Retrying next client...")
-                    clientIndex++
-                } else {
-                    success = true
+                while (coroutineContext.isActive && consecutiveFailures < 15) {
+                    val segments = fetchPlaylistSegments(client, manifestUrl)
+                    if (segments.isEmpty()) {
+                        consecutiveFailures++
+                        delay(4000)
+                        continue
+                    }
+                    
+                    consecutiveFailures = 0
+                    var progressUpdated = false
+                    
+                    for (segment in segments) {
+                        if (!coroutineContext.isActive) break
+                        if (downloadedSegments.contains(segment.url)) continue
+                        
+                        // Download segment
+                        val success = downloadSegmentToStream(client, segment.url, outputStream)
+                        if (success) {
+                            downloadedSegments.add(segment.url)
+                            totalBytes += segment.size
+                            totalSeconds += segment.duration.toLong()
+                            progressUpdated = true
+                        }
+                    }
+                    
+                    if (progressUpdated) {
+                        val recording = repository.getRecordingById(recordingId)
+                        if (recording != null && recording.status == "RECORDING") {
+                            // Update database
+                            val fileSizeStr = formatSize(totalBytes / 1024)
+                            repository.updateRecording(
+                                recording.copy(
+                                    fileSize = fileSizeStr,
+                                    durationSeconds = totalSeconds,
+                                    progress = 0.5f // active indicator
+                                )
+                            )
+                        }
+                    }
+                    
+                    delay(4000)
                 }
             }
-
-            if (!success) {
-                activeClient = "ffmpeg (HLS)"
-                repository.logWarn("All yt-dlp player clients failed. Falling back to FFmpeg HLS direct engine.")
+            
+            // If we completed cleanly, mark as COMPLETED
+            val recording = repository.getRecordingById(recordingId)
+            if (recording != null && recording.status == "RECORDING") {
+                repository.updateRecording(
+                    recording.copy(
+                        status = "COMPLETED",
+                        progress = 1.0f
+                    )
+                )
+                repository.logInfo("Recording COMPLETED: '${recording.streamTitle}'. Saved to '${recording.filePath}'")
+                updateNotification("Live Monitor", "Recording of '${recording.streamTitle}' completed.")
             }
-
-            val recording = RecordingItem(
-                channelId = channel.id,
-                channelName = channel.name,
-                streamTitle = title,
-                streamUrl = streamUrl,
-                status = "RECORDING",
-                playerClient = activeClient,
-                filePath = ".temp_cache/${channel.handle}_live.mp4"
-            )
-            repository.insertRecording(recording)
-            
-            // Update channel to IDLE or KEEP MONITORING
-            repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
-            
-            updateNotification("Active Recording: ${channel.name}", "Recording '${title}' using client '$activeClient'")
+        } catch (e: Exception) {
+            repository.logError("Download error: ${e.message}")
+            val recording = repository.getRecordingById(recordingId)
+            if (recording != null && recording.status == "RECORDING") {
+                repository.updateRecording(recording.copy(status = "CANCELLED"))
+            }
+        } finally {
+            activeDownloadJobs.remove(recordingId)
         }
+    }
+
+    private suspend fun fetchPlaylistSegments(client: OkHttpClient, playlistUrl: String): List<HlsSegment> {
+        val list = mutableListOf<HlsSegment>()
+        try {
+            val request = Request.Builder().url(playlistUrl).build()
+            val content = withContext(Dispatchers.IO) {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                }
+            } ?: return list
+            
+            var duration = 5.0
+            val lines = content.split("\n")
+            for (line in lines) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("#EXTINF:")) {
+                    val durationStr = trimmed.substringAfter("#EXTINF:").substringBefore(",")
+                    duration = durationStr.toDoubleOrNull() ?: 5.0
+                } else if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+                    val absoluteUrl = resolveAbsoluteUrl(playlistUrl, trimmed)
+                    // HlsSegment takes url, duration, and default size estimate (e.g. 500KB)
+                    list.add(HlsSegment(absoluteUrl, duration, 512000L))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return list
+    }
+
+    private suspend fun downloadSegmentToStream(
+        client: OkHttpClient,
+        segmentUrl: String,
+        outputStream: FileOutputStream
+    ): Boolean {
+        try {
+            val request = Request.Builder().url(segmentUrl).build()
+            return withContext(Dispatchers.IO) {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use false
+                    val body = response.body ?: return@use false
+                    body.byteStream().use { inputStream ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            outputStream.write(buffer, 0, bytesRead)
+                        }
+                    }
+                    true
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
+    }
+
+    private fun resolveAbsoluteUrl(baseUrl: String, relativeUrl: String): String {
+        return try {
+            val base = URL(baseUrl)
+            URL(base, relativeUrl).toString()
+        } catch (e: Exception) {
+            relativeUrl
+        }
+    }
+
+    private suspend fun checkLiveStream(handle: String): LiveInfo? {
+        val cleanHandle = if (handle.startsWith("@")) handle else "@$handle"
+        val url = "https://www.youtube.com/$cleanHandle/live"
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+            
+            val responseText = withContext(Dispatchers.IO) {
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                }
+            } ?: return null
+            
+            val playerResponse = extractInitialPlayerResponse(responseText) ?: return null
+            val videoDetails = playerResponse.optJSONObject("videoDetails") ?: return null
+            val streamingData = playerResponse.optJSONObject("streamingData")
+            
+            val videoId = videoDetails.optString("videoId") ?: ""
+            val title = videoDetails.optString("title") ?: "Live Stream"
+            val hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
+            
+            if (videoId.isNotEmpty() && hlsManifestUrl.isNotEmpty()) {
+                return LiveInfo(videoId, title, hlsManifestUrl)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
+    }
+
+    private fun extractInitialPlayerResponse(html: String): JSONObject? {
+        if (html.isEmpty()) return null
+        val markerString = "ytInitialPlayerResponse"
+        var markerStrIndex: Int = html.indexOf(markerString)
+        while (markerStrIndex >= 0) {
+            val markerLen: Int = markerString.length
+            val searchStart: Int = markerStrIndex + markerLen
+            val equalsIndex: Int = html.indexOf("=", searchStart)
+            if (equalsIndex < 0) return null
+            val objectSearchStart: Int = equalsIndex + 1
+            val objectStart: Int = html.indexOf("{", objectSearchStart)
+            if (objectStart < 0) return null
+            val objectEnd = findJsonObjectEnd(html, objectStart)
+            if (objectEnd > objectStart) {
+                try {
+                    return JSONObject(html.substring(objectStart, objectEnd + 1))
+                } catch (e: Exception) {
+                    // Ignore and try next
+                }
+            }
+            markerStrIndex = html.indexOf(markerString, objectStart + 1)
+        }
+        return null
+    }
+
+    private fun findJsonObjectEnd(text: String, objectStart: Int): Int {
+        var inString = false
+        var escaped = false
+        var depth = 0
+        for (i in objectStart until text.length) {
+            val ch = text[i]
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+                continue
+            }
+            if (ch == '"') {
+                inString = true
+            } else if (ch == '{') {
+                depth++
+            } else if (ch == '}') {
+                depth--
+                if (depth == 0) {
+                    return i
+                }
+            }
+        }
+        return -1
+    }
+
+    private fun getRecordingFolder(context: Context): File {
+        val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+        val appDir = File(downloadsDir, "LiveMonitor")
+        if (!appDir.exists()) {
+            appDir.mkdirs()
+        }
+        if (appDir.exists() && appDir.canWrite()) {
+            return appDir
+        }
+        val fallback = File(context.getExternalFilesDir(null), "Recordings")
+        fallback.mkdirs()
+        return fallback
     }
 
     private suspend fun simulateStreamForChannel(channelId: Int) {
         val channel = repository.getChannelById(channelId)
         if (channel != null) {
             repository.logInfo("Simulating Live Stream event for channel: ${channel.name}")
-            triggerRecording(channel, "Simulated Live: " + getStreamNamePlaceholder())
+            // Tears of Steel public HLS stream demo
+            val fakeManifest = "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"
+            triggerRecording(channel, "Simulated Live: Tears of Steel Demo", fakeManifest, "fake_video_id")
         }
     }
 
     private suspend fun simulateNetworkRestoration() {
-        repository.logInfo("MIUI DOZE / Network Restoration detected!")
-        repository.logInfo("Scanning recent streams tab via yt-dlp for missed streams in the outage window...")
-        delay(1500)
-        
-        // Find channels and create a missed stream for them
-        val channels = repository.allChannels.first()
-        if (channels.isNotEmpty()) {
-            val targetChannel = channels.first()
-            repository.logWarn("MISSED STREAM DETECTED: ${targetChannel.name} was live 30 mins ago!")
-            
-            val missedRecording = RecordingItem(
-                channelId = targetChannel.id,
-                channelName = targetChannel.name,
-                streamTitle = "Missed Stream: Late Night Chat & Chill",
-                streamUrl = "https://www.youtube.com/${targetChannel.handle}/live",
-                status = "MISSED",
-                playerClient = "N/A",
-                filePath = "N/A"
-            )
-            val id = repository.insertRecording(missedRecording)
-            
-            // Start downloading the missed stream!
-            repository.logInfo("Auto-downloading missed stream from completed stream URL...")
-            delay(1000)
-            
-            val downloadUrl = "https://www.youtube.com/watch?v=missed_${Random.nextInt(1000, 9999)}"
-            startCompletedStreamDownload(downloadUrl, "Auto-Recover: ${targetChannel.name} - Late Night Chat & Chill", id.toInt())
-        }
+        repository.logInfo("Network Restoration detected!")
+        repository.logInfo("Scanning recent streams...")
     }
 
     private fun startCompletedStreamDownload(url: String, title: String, existingRecordingId: Int = -1) {
         scope.launch {
-            repository.logInfo("Starting completed stream download for URL: $url")
-            repository.logInfo("Updating yt-dlp to latest stable binary...")
-            delay(1000)
-            repository.logInfo("yt-dlp updated successfully.")
-            repository.logInfo("Executing: yt-dlp --extractor-args \"tv_embedded:skip=dash\" -f bestvideo+bestaudio $url")
-            
+            repository.logInfo("Starting download for URL: $url")
+            val storageFolder = getRecordingFolder(this@MonitorService)
+            val fileName = "completed_${System.currentTimeMillis() / 1000}.ts"
+            val outputFile = File(storageFolder, fileName)
+
             val recording = if (existingRecordingId != -1) {
                 repository.getRecordingById(existingRecordingId)?.copy(
                     streamUrl = url,
                     status = "RECORDING",
-                    playerClient = "tv_embedded;skip=dash",
-                    filePath = ".temp_cache/recovered_stream.mp4",
+                    filePath = outputFile.absolutePath,
                     urlType = "COMPLETED"
                 )
             } else {
@@ -267,61 +463,97 @@ class MonitorService : Service() {
                     streamTitle = title,
                     streamUrl = url,
                     status = "RECORDING",
-                    playerClient = "tv_embedded;skip=dash",
-                    filePath = ".temp_cache/direct_download_${System.currentTimeMillis() % 1000}.mp4",
+                    filePath = outputFile.absolutePath,
                     urlType = "COMPLETED"
                 )
             }
 
             if (recording != null) {
-                if (existingRecordingId != -1) {
+                val id = if (existingRecordingId != -1) {
                     repository.updateRecording(recording)
+                    existingRecordingId
                 } else {
-                    repository.insertRecording(recording)
+                    repository.insertRecording(recording).toInt()
+                }
+
+                // If URL is an m3u8 playlist, start download. Otherwise download directly
+                if (url.contains(".m3u8")) {
+                    val downloadJob = scope.launch {
+                        runHlsDownload(id, url, outputFile.absolutePath)
+                    }
+                    activeDownloadJobs[id] = downloadJob
+                } else {
+                    // Progressive direct file download
+                    val downloadJob = scope.launch {
+                        runDirectFileDownload(id, url, outputFile.absolutePath)
+                    }
+                    activeDownloadJobs[id] = downloadJob
                 }
             }
         }
     }
 
-    private fun startProgressTracker() {
-        scope.launch {
-            while (true) {
-                delay(2000) // update every 2 seconds
-                val activeRecordings = repository.allRecordings.first().filter { it.status == "RECORDING" }
-                
-                for (rec in activeRecordings) {
-                    val nextProgress = rec.progress + 0.02f
-                    val isFinished = nextProgress >= 1.0f
-                    
-                    val currentSeconds = rec.durationSeconds + 2
-                    val currentSizeKB = (currentSeconds * (Random.nextInt(150, 300))).toLong()
-                    val sizeString = formatSize(currentSizeKB)
-                    
-                    if (isFinished) {
-                        // Completed! Move to completed folder
-                        val completedFilePath = "completed/${rec.channelName.replace(" ", "_")}_${System.currentTimeMillis() / 1000}.mp4"
-                        val updated = rec.copy(
-                            progress = 1.0f,
-                            status = "COMPLETED",
-                            durationSeconds = currentSeconds,
-                            fileSize = sizeString,
-                            filePath = completedFilePath
-                        )
-                        repository.updateRecording(updated)
-                        repository.logInfo("Recording COMPLETED: '${rec.streamTitle}'. Moved from '.temp_cache' to '$completedFilePath'")
-                        repository.logInfo("Copied completed file to output folder: 'Download/L M Downloads/'")
-                        
-                        updateNotification("Live Monitor", "Recording of '${rec.streamTitle}' completed.")
-                    } else {
-                        val updated = rec.copy(
-                            progress = nextProgress,
-                            durationSeconds = currentSeconds,
-                            fileSize = sizeString
-                        )
-                        repository.updateRecording(updated)
+    private suspend fun runDirectFileDownload(recordingId: Int, fileUrl: String, outputFilePath: String) {
+        val client = okHttpClient
+        val outputFile = File(outputFilePath)
+        outputFile.parentFile?.mkdirs()
+
+        try {
+            val request = Request.Builder().url(fileUrl).build()
+            val success = withContext(Dispatchers.IO) {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use false
+                    val body = response.body ?: return@use false
+                    FileOutputStream(outputFile).use { outputStream ->
+                        body.byteStream().use { inputStream ->
+                            val buffer = ByteArray(8192)
+                            var bytesRead: Int
+                            var downloadedBytes = 0L
+                            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                                if (!coroutineContext.isActive) break
+                                outputStream.write(buffer, 0, bytesRead)
+                                downloadedBytes += bytesRead
+                                
+                                // Update database periodically
+                                val fileSizeStr = formatSize(downloadedBytes / 1024)
+                                val recording = repository.getRecordingById(recordingId)
+                                if (recording != null) {
+                                    repository.updateRecording(
+                                        recording.copy(
+                                            fileSize = fileSizeStr,
+                                            progress = 0.5f
+                                        )
+                                    )
+                                }
+                            }
+                        }
                     }
+                    true
                 }
             }
+
+            val recording = repository.getRecordingById(recordingId)
+            if (recording != null) {
+                if (success && coroutineContext.isActive) {
+                    repository.updateRecording(
+                        recording.copy(
+                            status = "COMPLETED",
+                            progress = 1.0f
+                        )
+                    )
+                    repository.logInfo("Direct download completed: '${recording.streamTitle}'")
+                } else {
+                    repository.updateRecording(recording.copy(status = "CANCELLED"))
+                }
+            }
+        } catch (e: Exception) {
+            repository.logError("Direct download failed: ${e.message}")
+            val recording = repository.getRecordingById(recordingId)
+            if (recording != null) {
+                repository.updateRecording(recording.copy(status = "CANCELLED"))
+            }
+        } finally {
+            activeDownloadJobs.remove(recordingId)
         }
     }
 
@@ -336,22 +568,20 @@ class MonitorService : Service() {
 
     fun stopRecording(recordingId: Int) {
         scope.launch {
+            activeDownloadJobs[recordingId]?.cancel()
+            activeDownloadJobs.remove(recordingId)
+            
             val rec = repository.getRecordingById(recordingId)
             if (rec != null) {
-                val completedFilePath = "completed/Stopped_${rec.channelName.replace(" ", "_")}_${System.currentTimeMillis() / 1000}.mp4"
-                val updated = rec.copy(
-                    status = "CANCELLED",
-                    filePath = completedFilePath
-                )
+                val updated = rec.copy(status = "CANCELLED")
                 repository.updateRecording(updated)
-                repository.logWarn("Recording of '${rec.streamTitle}' STOPPED and SAVED by user.")
+                repository.logWarn("Recording of '${rec.streamTitle}' STOPPED and SAVED.")
                 
-                // If it belongs to a channel, change channel state to PAUSED
                 if (rec.channelId != -1) {
                     val channel = repository.getChannelById(rec.channelId)
                     if (channel != null) {
                         repository.updateChannel(channel.copy(status = "PAUSED"))
-                        repository.logWarn("Channel ${channel.name} moved to PAUSED state. Auto-monitoring suspended.")
+                        repository.logWarn("Channel ${channel.name} moved to PAUSED state.")
                     }
                 }
             }
@@ -362,10 +592,38 @@ class MonitorService : Service() {
         scope.launch {
             val rec = repository.getRecordingById(recordingId)
             if (rec != null) {
-                val nextStatus = if (rec.status == "RECORDING") "PAUSED" else "RECORDING"
-                val updated = rec.copy(status = nextStatus)
-                repository.updateRecording(updated)
-                repository.logInfo("Recording of '${rec.streamTitle}' is now ${updated.status}.")
+                val nextStatus = if (rec.status == "RECORDING") {
+                    activeDownloadJobs[recordingId]?.cancel()
+                    activeDownloadJobs.remove(recordingId)
+                    "PAUSED"
+                } else {
+                    // Resume HLS download
+                    if (rec.urlType == "LIVE") {
+                        val liveInfo = checkLiveStream(rec.channelName)
+                        if (liveInfo != null) {
+                            val downloadJob = scope.launch {
+                                runHlsDownload(recordingId, liveInfo.hlsManifestUrl, rec.filePath)
+                            }
+                            activeDownloadJobs[recordingId] = downloadJob
+                        }
+                    } else {
+                        if (rec.streamUrl.contains(".m3u8")) {
+                            val downloadJob = scope.launch {
+                                runHlsDownload(recordingId, rec.streamUrl, rec.filePath)
+                            }
+                            activeDownloadJobs[recordingId] = downloadJob
+                        } else {
+                            val downloadJob = scope.launch {
+                                runDirectFileDownload(recordingId, rec.streamUrl, rec.filePath)
+                            }
+                            activeDownloadJobs[recordingId] = downloadJob
+                        }
+                    }
+                    "RECORDING"
+                }
+                
+                repository.updateRecording(rec.copy(status = nextStatus))
+                repository.logInfo("Recording of '${rec.streamTitle}' is now $nextStatus.")
             }
         }
     }
@@ -373,6 +631,8 @@ class MonitorService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         _isServiceRunning.value = false
+        activeDownloadJobs.values.forEach { it.cancel() }
+        activeDownloadJobs.clear()
         job.cancel()
     }
 
@@ -426,3 +686,6 @@ class MonitorService : Service() {
         const val ACTION_DOWNLOAD_URL = "com.example.service.action.DOWNLOAD_URL"
     }
 }
+
+data class LiveInfo(val videoId: String, val title: String, val hlsManifestUrl: String)
+data class HlsSegment(val url: String, val duration: Double, val size: Long)
