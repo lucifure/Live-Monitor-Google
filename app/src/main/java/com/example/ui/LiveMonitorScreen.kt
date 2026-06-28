@@ -299,6 +299,7 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
                     onToggleMonitoring = { viewModel.toggleChannelStatus(it) },
                     onDeleteChannel = { viewModel.deleteChannel(it) },
                     onTriggerSimulateLive = { viewModel.simulateStream(it) },
+                    onForceCheck = { viewModel.manuallyPoll() },
                     onAddChannelClicked = { showAddChannelDialog = true }
                 )
                 1 -> DownloadsTab(
@@ -585,6 +586,7 @@ fun ChannelsTab(
     onToggleMonitoring: (MonitoredChannel) -> Unit,
     onDeleteChannel: (Int) -> Unit,
     onTriggerSimulateLive: (Int) -> Unit,
+    onForceCheck: () -> Unit,
     onAddChannelClicked: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
@@ -664,7 +666,8 @@ fun ChannelsTab(
                             channel = channel,
                             onToggleMonitoring = { onToggleMonitoring(channel) },
                             onDelete = { onDeleteChannel(channel.id) },
-                            onSimulateLive = { onTriggerSimulateLive(channel.id) }
+                            onSimulateLive = { onTriggerSimulateLive(channel.id) },
+                            onForceCheck = onForceCheck
                         )
                     }
                     
@@ -706,7 +709,8 @@ fun ChannelCard(
     channel: MonitoredChannel,
     onToggleMonitoring: () -> Unit,
     onDelete: () -> Unit,
-    onSimulateLive: () -> Unit
+    onSimulateLive: () -> Unit,
+    onForceCheck: () -> Unit
 ) {
     val badgeColor = when (channel.status) {
         "MONITORING" -> CyberGreen
@@ -854,6 +858,25 @@ fun ChannelCard(
                     }
 
                     Row {
+                        // Real Check Now Button
+                        if (channel.status == "MONITORING") {
+                            IconButton(
+                                onClick = onForceCheck,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(CyberGreen.copy(alpha = 0.1f))
+                                    .size(36.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Check Now",
+                                    tint = CyberGreen,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+
                         // Quick Simulate Stream Button
                         if (channel.status == "MONITORING") {
                             IconButton(

@@ -143,6 +143,9 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
             val channel = MonitoredChannel(name = displayName, handle = cleanHandle, status = "MONITORING")
             val id = repository.insertChannel(channel)
             
+            // Trigger manual check immediately so the user doesn't have to wait 60 seconds
+            manuallyPoll()
+            
             // Asynchronously fetch display name from YouTube to resolve channel's official name
             launch(Dispatchers.IO) {
                 try {

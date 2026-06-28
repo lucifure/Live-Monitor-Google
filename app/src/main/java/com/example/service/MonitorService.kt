@@ -370,27 +370,87 @@ class MonitorService : Service() {
                 }
             } ?: return null
             
-            // If redirected to /watch?v= or /live/, the channel is LIVE
-            val isLive = finalUrl.contains("/watch?v=") || finalUrl.contains("/live/")
-            if (isLive) {
-                val videoId = if (finalUrl.contains("/watch?v=")) {
-                    finalUrl.substringAfter("/watch?v=").substringBefore("&")
+            var isLive = false
+            var videoId = ""
+            
+            // 1. Check if the final URL itself got redirected to watch?v= or /live/ (with a trailing slash + ID)
+            if (finalUrl.contains("/watch?v=") || (finalUrl.contains("/live/") && !finalUrl.endsWith("/live") && !finalUrl.endsWith("/live/"))) {
+                isLive = true
+                videoId = if (finalUrl.contains("/watch?v=")) {
+                    finalUrl.substringAfter("/watch?v=").substringBefore("&").substringBefore("?")
                 } else {
                     finalUrl.substringAfter("/live/").substringBefore("?")
                 }
+            }
+            
+            // 2. Check canonical or og:url in HTML
+            if (!isLive) {
+                val ogUrlRegex = """<meta\s+property="og:url"\s+content="([^"]+)"""".toRegex(RegexOption.IGNORE_CASE)
+                val canonicalRegex = """<link\s+rel="canonical"\s+href="([^"]+)"""".toRegex(RegexOption.IGNORE_CASE)
                 
-                var title = "Live Stream"
-                var hlsManifestUrl = ""
+                val ogUrlMatch = ogUrlRegex.find(responseText)
+                val canonicalMatch = canonicalRegex.find(responseText)
                 
-                val playerResponse = extractInitialPlayerResponse(responseText)
-                if (playerResponse != null) {
-                    val videoDetails = playerResponse.optJSONObject("videoDetails")
-                    title = videoDetails?.optString("title") ?: "Live Stream"
-                    val streamingData = playerResponse.optJSONObject("streamingData")
-                    hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
+                val targetUrl = ogUrlMatch?.groupValues?.get(1) ?: canonicalMatch?.groupValues?.get(1) ?: ""
+                if (targetUrl.contains("/watch?v=") || (targetUrl.contains("/live/") && !targetUrl.endsWith("/live") && !targetUrl.endsWith("/live/"))) {
+                    isLive = true
+                    videoId = if (targetUrl.contains("/watch?v=")) {
+                        targetUrl.substringAfter("/watch?v=").substringBefore("&").substringBefore("?")
+                    } else {
+                        targetUrl.substringAfter("/live/").substringBefore("?")
+                    }
+                }
+            }
+            
+            // 3. Check ytInitialPlayerResponse JSON
+            var title = "Live Stream"
+            var hlsManifestUrl = ""
+            
+            val playerResponse = extractInitialPlayerResponse(responseText)
+            if (playerResponse != null) {
+                val videoDetails = playerResponse.optJSONObject("videoDetails")
+                val isLiveProp = videoDetails?.optBoolean("isLive") ?: false
+                val isLiveStreamProp = videoDetails?.optBoolean("isLiveStream") ?: false
+                val videoIdProp = videoDetails?.optString("videoId") ?: ""
+                
+                if ((isLiveProp || isLiveStreamProp) && videoIdProp.isNotEmpty()) {
+                    isLive = true
+                    videoId = videoIdProp
+                    title = videoDetails.optString("title") ?: title
                 }
                 
-                // Backup parsing of hlsManifestUrl directly from raw HTML
+                val streamingData = playerResponse.optJSONObject("streamingData")
+                hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
+            }
+            
+            // 4. Fallback: Search for isLive, videoId, and title using regex in HTML
+            if (!isLive) {
+                val videoIdRegex = """"videoId"\s*:\s*"([^"]+)"""".toRegex()
+                val isLiveRegex = """"isLive"\s*:\s*true""".toRegex()
+                
+                val videoIdMatch = videoIdRegex.find(responseText)
+                val hasIsLive = isLiveRegex.containsMatchIn(responseText) || responseText.contains("\"isLiveStream\":true")
+                
+                if (hasIsLive && videoIdMatch != null) {
+                    isLive = true
+                    videoId = videoIdMatch.groupValues[1]
+                }
+            }
+            
+            if (isLive && videoId.isNotEmpty()) {
+                // Parse title if we don't have a good one
+                if (title == "Live Stream" || title.isBlank()) {
+                    val ogTitleRegex = """<meta\s+property="og:title"\s+content="([^"]+)"""".toRegex(RegexOption.IGNORE_CASE)
+                    val titleRegex = """<title>([^<]+)</title>""".toRegex(RegexOption.IGNORE_CASE)
+                    
+                    val ogTitleMatch = ogTitleRegex.find(responseText)
+                    val titleMatch = titleRegex.find(responseText)
+                    
+                    val rawTitle = ogTitleMatch?.groupValues?.get(1) ?: titleMatch?.groupValues?.get(1) ?: "Live Stream"
+                    title = rawTitle.replace(" - YouTube", "").trim()
+                }
+                
+                // Parse hlsManifestUrl if still empty
                 if (hlsManifestUrl.isEmpty()) {
                     val marker = "hlsManifestUrl\":\""
                     val index = responseText.indexOf(marker)
@@ -403,9 +463,7 @@ class MonitorService : Service() {
                     }
                 }
                 
-                if (videoId.isNotEmpty()) {
-                    return LiveInfo(videoId, title, hlsManifestUrl)
-                }
+                return LiveInfo(videoId, title, hlsManifestUrl)
             }
         } catch (e: Exception) {
             e.printStackTrace()
