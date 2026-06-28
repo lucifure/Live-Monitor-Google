@@ -336,15 +336,16 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
             text = {
                 Column {
                     Text(
-                        text = "Enter the channel details to monitor and record live streams from start.",
+                        text = "Paste a full YouTube channel URL (e.g. https://youtube.com/@lofigirl) or type a handle. The app will automatically extract the handle and attempt to resolve the channel name from YouTube.",
                         color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 13.sp,
+                        fontSize = 12.sp,
                         modifier = Modifier.padding(bottom = 16.dp)
                     )
                     OutlinedTextField(
-                        value = nameInput,
-                        onValueChange = { nameInput = it },
-                        label = { Text("Channel Name", color = Color.White.copy(alpha = 0.6f)) },
+                        value = handleInput,
+                        onValueChange = { handleInput = it },
+                        label = { Text("YouTube URL or @Handle (Required)", color = CyberBlue) },
+                        placeholder = { Text("e.g. @lofigirl or channel link", color = Color.White.copy(alpha = 0.3f)) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = CyberBlue,
@@ -355,12 +356,13 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 12.dp)
-                            .testTag("add_channel_name_input")
+                            .testTag("add_channel_handle_input")
                     )
                     OutlinedTextField(
-                        value = handleInput,
-                        onValueChange = { handleInput = it },
-                        label = { Text("Handle (e.g. @darth_mb)", color = Color.White.copy(alpha = 0.6f)) },
+                        value = nameInput,
+                        onValueChange = { nameInput = it },
+                        label = { Text("Custom Channel Name (Optional)", color = Color.White.copy(alpha = 0.6f)) },
+                        placeholder = { Text("Left blank to auto-detect", color = Color.White.copy(alpha = 0.3f)) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = CyberBlue,
@@ -371,14 +373,14 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("add_channel_handle_input")
+                            .testTag("add_channel_name_input")
                     )
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        if (nameInput.isNotBlank() && handleInput.isNotBlank()) {
+                        if (handleInput.isNotBlank()) {
                             viewModel.addChannel(nameInput, handleInput)
                             showAddChannelDialog = false
                         }

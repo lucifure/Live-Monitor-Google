@@ -21,6 +21,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.Locale
 
 class LiveMonitorViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -72,25 +77,30 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
         // Bind foreground service
         bindMonitorService()
 
-        // Insert default channel if empty
+        // Insert default channels only on the first launch
         viewModelScope.launch {
-            val list = repository.allChannels.first()
-            if (list.isEmpty()) {
-                // Seed standard channels
-                repository.insertChannel(
-                    MonitoredChannel(
-                        name = "Darth MB (Retro Live)",
-                        handle = "@darth_mb",
-                        status = "MONITORING"
+            val sharedPrefs = application.getSharedPreferences("live_monitor_prefs", Context.MODE_PRIVATE)
+            val seeded = sharedPrefs.getBoolean("channels_seeded", false)
+            if (!seeded) {
+                val list = repository.allChannels.first()
+                if (list.isEmpty()) {
+                    // Seed standard channels
+                    repository.insertChannel(
+                        MonitoredChannel(
+                            name = "Darth MB (Retro Live)",
+                            handle = "@darth_mb",
+                            status = "MONITORING"
+                        )
                     )
-                )
-                repository.insertChannel(
-                    MonitoredChannel(
-                        name = "Lofi Girl Live",
-                        handle = "@lofigirl",
-                        status = "PAUSED"
+                    repository.insertChannel(
+                        MonitoredChannel(
+                            name = "Lofi Girl Live",
+                            handle = "@lofigirl",
+                            status = "PAUSED"
+                        )
                     )
-                )
+                }
+                sharedPrefs.edit().putBoolean("channels_seeded", true).apply()
             }
         }
     }
@@ -123,8 +133,31 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
     // Channels Actions
     fun addChannel(name: String, handle: String) {
         viewModelScope.launch {
-            val formattedHandle = if (handle.startsWith("@")) handle else "@$handle"
-            repository.insertChannel(MonitoredChannel(name = name, handle = formattedHandle))
+            val cleanHandle = extractHandleFromInput(handle)
+            val displayName = name.trim().ifBlank {
+                val base = cleanHandle.substringAfterLast("/")
+                base.replace("@", "").replace("_", " ").capitalizeWords()
+            }
+            
+            repository.logInfo("Adding channel. Input: '$handle' -> Cleaned: '$cleanHandle', Name: '$displayName'")
+            val channel = MonitoredChannel(name = displayName, handle = cleanHandle, status = "MONITORING")
+            val id = repository.insertChannel(channel)
+            
+            // Asynchronously fetch display name from YouTube to resolve channel's official name
+            launch(Dispatchers.IO) {
+                try {
+                    val actualName = fetchChannelDisplayNameFromYouTube(cleanHandle)
+                    if (!actualName.isNullOrBlank()) {
+                        val currentChannel = repository.getChannelById(id.toInt())
+                        if (currentChannel != null && currentChannel.name == displayName) {
+                            repository.updateChannel(currentChannel.copy(name = actualName))
+                            repository.logInfo("Resolved channel identity: '$cleanHandle' is named '$actualName'")
+                        }
+                    }
+                } catch (e: Exception) {
+                    repository.logWarn("Could not fetch channel display name for '$cleanHandle': ${e.message}")
+                }
+            }
         }
     }
 
@@ -198,6 +231,112 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
         super.onCleared()
         if (_isServiceBound.value) {
             getApplication<Application>().unbindService(serviceConnection)
+        }
+    }
+
+    // Helper to capitalize words for temporary names
+    private fun String.capitalizeWords(): String {
+        return this.split(" ")
+            .filter { it.isNotEmpty() }
+            .joinToString(" ") { it.replaceFirstChar { char -> if (char.isLowerCase()) char.titlecase(Locale.ROOT) else char.toString() } }
+    }
+
+    // Helper to extract a clean handle/path from any YouTube link/handle input
+    private fun extractHandleFromInput(input: String): String {
+        val trimmed = input.trim()
+        
+        // 1. Full YouTube URLs
+        if (trimmed.contains("youtube.com") || trimmed.contains("youtu.be")) {
+            // Match handles: youtube.com/@handle
+            val handleRegex = "youtube\\.com/@([^/?#\\s]+)".toRegex(RegexOption.IGNORE_CASE)
+            val handleMatch = handleRegex.find(trimmed)
+            if (handleMatch != null) {
+                val handle = handleMatch.groupValues[1]
+                return if (handle.startsWith("@")) handle else "@$handle"
+            }
+            
+            // Match c/custom_name
+            val cRegex = "youtube\\.com/c/([^/?#\\s]+)".toRegex(RegexOption.IGNORE_CASE)
+            val cMatch = cRegex.find(trimmed)
+            if (cMatch != null) {
+                return "@" + cMatch.groupValues[1]
+            }
+            
+            // Match channel/UC...
+            val channelRegex = "youtube\\.com/channel/([^/?#\\s]+)".toRegex(RegexOption.IGNORE_CASE)
+            val channelMatch = channelRegex.find(trimmed)
+            if (channelMatch != null) {
+                return "channel/" + channelMatch.groupValues[1]
+            }
+            
+            // Match user/name
+            val userRegex = "youtube\\.com/user/([^/?#\\s]+)".toRegex(RegexOption.IGNORE_CASE)
+            val userMatch = userRegex.find(trimmed)
+            if (userMatch != null) {
+                return "user/" + userMatch.groupValues[1]
+            }
+        }
+        
+        // 2. Raw inputs
+        var handle = trimmed.removeSuffix("/").substringAfterLast("/")
+        if (handle.isEmpty()) return "@unknown"
+        
+        if (!handle.startsWith("@") && !handle.startsWith("channel/") && !handle.startsWith("user/")) {
+            handle = "@$handle"
+        }
+        return handle
+    }
+
+    // Helper to fetch the actual display name from YouTube page
+    private suspend fun fetchChannelDisplayNameFromYouTube(handle: String): String? {
+        val client = OkHttpClient()
+        val url = "https://www.youtube.com/$handle"
+        
+        return withContext(Dispatchers.IO) {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                    .build()
+                
+                val html = client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                } ?: return@withContext null
+                
+                // Try og:title meta tag first
+                val ogTitleMarker = "<meta property=\"og:title\" content=\""
+                val ogTitleIndex = html.indexOf(ogTitleMarker)
+                if (ogTitleIndex >= 0) {
+                    val contentStart = ogTitleIndex + ogTitleMarker.length
+                    val contentEnd = html.indexOf("\"", contentStart)
+                    if (contentEnd > contentStart) {
+                        val ogTitle = html.substring(contentStart, contentEnd)
+                        if (ogTitle.isNotEmpty() && ogTitle != "YouTube") {
+                            return@withContext ogTitle
+                        }
+                    }
+                }
+                
+                // Try <title> tag fallback
+                val titleStartMarker = "<title>"
+                val titleEndMarker = "</title>"
+                val titleStartIndex = html.indexOf(titleStartMarker)
+                if (titleStartIndex >= 0) {
+                    val contentStart = titleStartIndex + titleStartMarker.length
+                    val titleEndIndex = html.indexOf(titleEndMarker, contentStart)
+                    if (titleEndIndex > contentStart) {
+                        var title = html.substring(contentStart, titleEndIndex)
+                        title = title.replace(" - YouTube", "").trim()
+                        if (title.isNotEmpty() && title != "YouTube") {
+                            return@withContext title
+                        }
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
         }
     }
 }
