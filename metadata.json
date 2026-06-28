@@ -1,0 +1,6 @@
+{
+  "name": "Live Monitor",
+  "description": "Monitors YouTube channels and automatically records live streams using advanced polling and robust fallback player pipelines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
