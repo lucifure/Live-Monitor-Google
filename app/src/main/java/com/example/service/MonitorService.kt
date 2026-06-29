@@ -48,6 +48,7 @@ class MonitorService : Service() {
         .build()
 
     private val activeDownloadJobs = ConcurrentHashMap<Int, Job>()
+    private var isForeground = false
 
     inner class LocalBinder : Binder() {
         fun getService(): MonitorService = this@MonitorService
@@ -63,30 +64,38 @@ class MonitorService : Service() {
         repository = LiveMonitorRepository(db)
         _isServiceRunning.value = true
         createNotificationChannel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds.")
-            )
-        }
-        
-        // Start background polling and checking
-        startChannelPolling()
         
         scope.launch {
-            repository.logInfo("Live Monitor Service started.")
-            repository.logInfo("WAKELOCK requested: PARTIAL_WAKE_LOCK held to prevent sleep.")
-            repository.logInfo("Keep-alive scheduled: Firing network check every 5 mins.")
+            repository.logInfo("Live Monitor Service created.")
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!isForeground) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds.")
+                )
+            }
+            isForeground = true
+            
+            // Start background polling and checking
+            startChannelPolling()
+            
+            scope.launch {
+                repository.logInfo("Live Monitor Service started.")
+                repository.logInfo("WAKELOCK requested: PARTIAL_WAKE_LOCK held to prevent sleep.")
+                repository.logInfo("Keep-alive scheduled: Firing network check every 5 mins.")
+            }
+        }
+
         val action = intent?.action
         if (action != null) {
             handleAction(action, intent)
