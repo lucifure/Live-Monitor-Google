@@ -79,9 +79,6 @@ class MonitorService : Service() {
         // Start background polling and checking
         startChannelPolling()
         
-        // Automatically verify yt-dlp engine integrity on startup and repair if corrupted
-        ensureYtDlpEngineReady()
-        
         scope.launch {
             repository.logInfo("Live Monitor Service started.")
             repository.logInfo("WAKELOCK requested: PARTIAL_WAKE_LOCK held to prevent sleep.")
