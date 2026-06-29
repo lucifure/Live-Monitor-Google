@@ -78,7 +78,7 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
         bindMonitorService()
 
         // Insert default channels only on the first launch
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val sharedPrefs = application.getSharedPreferences("live_monitor_prefs", Context.MODE_PRIVATE)
             val seeded = sharedPrefs.getBoolean("channels_seeded", false)
             if (!seeded) {
@@ -226,6 +226,13 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
     fun updateYtDlpEngine() {
         val intent = Intent(getApplication(), MonitorService::class.java).apply {
             action = MonitorService.ACTION_UPDATE_ENGINE
+        }
+        getApplication<Application>().startService(intent)
+    }
+
+    fun resetYtDlpEngine() {
+        val intent = Intent(getApplication(), MonitorService::class.java).apply {
+            action = MonitorService.ACTION_RESET_ENGINE
         }
         getApplication<Application>().startService(intent)
     }

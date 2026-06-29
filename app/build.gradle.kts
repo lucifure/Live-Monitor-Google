@@ -22,12 +22,13 @@ android {
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     ndk {
-      abiFilters.addAll(setOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+      abiFilters.addAll(setOf("armeabi-v7a", "arm64-v8a"))
     }
   }
 
   packaging {
     jniLibs {
+      useLegacyPackaging = true
       pickFirsts.addAll(setOf("**/lib*.so", "**/libc++_shared.so"))
     }
   }

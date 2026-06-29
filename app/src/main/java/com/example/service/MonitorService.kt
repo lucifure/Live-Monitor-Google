@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -62,13 +63,24 @@ class MonitorService : Service() {
         repository = LiveMonitorRepository(db)
         _isServiceRunning.value = true
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds.")
+            )
+        }
         
         // Start background polling and checking
         startChannelPolling()
         
-        // Automatically check for yt-dlp binary updates on startup
-        updateYtDlpEngine()
+        // Automatically verify yt-dlp engine integrity on startup and repair if corrupted
+        ensureYtDlpEngineReady()
         
         scope.launch {
             repository.logInfo("Live Monitor Service started.")
@@ -115,6 +127,10 @@ class MonitorService : Service() {
                 ACTION_UPDATE_ENGINE -> {
                     repository.logInfo("Manual yt-dlp update triggered.")
                     updateYtDlpEngine()
+                }
+                ACTION_RESET_ENGINE -> {
+                    repository.logInfo("Manual yt-dlp engine reset/rollback triggered.")
+                    resetAndCleanYtDlp()
                 }
             }
         }
@@ -918,17 +934,114 @@ class MonitorService : Service() {
         }
     }
 
-    private fun updateYtDlpEngine() {
+    private fun ensureYtDlpEngineReady() {
         scope.launch(Dispatchers.IO) {
-            repository.logWarn("Checking for yt-dlp engine updates...")
+            repository.logInfo("Verifying yt-dlp engine integrity...")
             try {
                 com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
-                val status = com.yausername.youtubedl_android.YoutubeDL.getInstance().updateYoutubeDL(applicationContext)
-                repository.logInfo("yt-dlp engine update completed: $status")
+                com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
+                val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                repository.logInfo("yt-dlp engine verified. Version: $ver")
             } catch (e: Exception) {
-                val detailedError = "yt-dlp engine update failed: ${e.message}. Cause: ${e.cause?.message}. Stack: ${android.util.Log.getStackTraceString(e)}"
+                repository.logError("yt-dlp engine integrity check failed: ${e.message}. Attempting automatic self-repair...")
+                try {
+                    val noBackupDir = File(applicationContext.noBackupFilesDir, "youtubedl-android")
+                    if (noBackupDir.exists()) {
+                        noBackupDir.deleteRecursively()
+                    }
+                    val filesDir = File(applicationContext.filesDir, "youtubedl-android")
+                    if (filesDir.exists()) {
+                        filesDir.deleteRecursively()
+                    }
+                    com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                    com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
+                    val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                    repository.logInfo("yt-dlp engine self-repair successful! Restored to pre-bundled version: $ver")
+                } catch (repairEx: Exception) {
+                    val fatalErr = "yt-dlp engine self-repair failed: ${repairEx.message}"
+                    repository.logError(fatalErr)
+                    android.util.Log.e("MonitorService", fatalErr, repairEx)
+                }
+            }
+        }
+    }
+
+    private fun updateYtDlpEngine() {
+        scope.launch(Dispatchers.IO) {
+            repository.logWarn("Starting manual update of yt-dlp engine to Python 3.8 compatible v2025.01.12...")
+            try {
+                // Ensure base directory/extraction is initialized
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                
+                val url = "https://github.com/yt-dlp/yt-dlp/releases/download/2025.01.12/yt-dlp"
+                val request = Request.Builder().url(url).build()
+                
+                val targetFileNoBackup = File(applicationContext.noBackupFilesDir, "youtubedl-android/youtube-dl")
+                val targetFileFiles = File(applicationContext.filesDir, "youtubedl-android/youtube-dl")
+                
+                targetFileNoBackup.parentFile?.mkdirs()
+                
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw java.io.IOException("Failed to download: ${response.code} ${response.message}")
+                    }
+                    val body = response.body ?: throw java.io.IOException("Null response body")
+                    
+                    targetFileNoBackup.outputStream().use { fos ->
+                        body.byteStream().copyTo(fos)
+                    }
+                    targetFileNoBackup.setExecutable(true, false)
+                    
+                    if (targetFileFiles.parentFile?.exists() == true) {
+                        targetFileNoBackup.copyTo(targetFileFiles, overwrite = true)
+                        targetFileFiles.setExecutable(true, false)
+                    }
+                }
+                
+                val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                repository.logInfo("yt-dlp engine updated successfully to v2025.01.12! Current engine version: $ver")
+            } catch (e: Exception) {
+                val detailedError = "yt-dlp engine update failed: ${e.message}. Attempting rollback to pre-bundled version..."
                 repository.logError(detailedError)
                 android.util.Log.e("MonitorService", detailedError, e)
+                
+                try {
+                    val noBackupDir = File(applicationContext.noBackupFilesDir, "youtubedl-android")
+                    if (noBackupDir.exists()) noBackupDir.deleteRecursively()
+                    val filesDir = File(applicationContext.filesDir, "youtubedl-android")
+                    if (filesDir.exists()) filesDir.deleteRecursively()
+                    
+                    com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                    com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
+                    val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                    repository.logInfo("Rollback successful. Pre-bundled version restored: $ver")
+                } catch (rollbackEx: Exception) {
+                    repository.logError("Rollback failed: ${rollbackEx.message}")
+                }
+            }
+        }
+    }
+
+    private fun resetAndCleanYtDlp() {
+        scope.launch(Dispatchers.IO) {
+            repository.logWarn("Resetting and cleaning yt-dlp to pre-bundled version...")
+            try {
+                val noBackupDir = File(applicationContext.noBackupFilesDir, "youtubedl-android")
+                if (noBackupDir.exists()) {
+                    noBackupDir.deleteRecursively()
+                }
+                val filesDir = File(applicationContext.filesDir, "youtubedl-android")
+                if (filesDir.exists()) {
+                    filesDir.deleteRecursively()
+                }
+                
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
+                com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
+                
+                val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                repository.logInfo("yt-dlp engine rollback completed successfully! Version: $ver")
+            } catch (e: Exception) {
+                repository.logError("Failed to reset yt-dlp engine: ${e.message}")
             }
         }
     }
@@ -966,6 +1079,7 @@ class MonitorService : Service() {
         const val ACTION_RESTORE_NETWORK = "com.example.service.action.RESTORE_NETWORK"
         const val ACTION_DOWNLOAD_URL = "com.example.service.action.DOWNLOAD_URL"
         const val ACTION_UPDATE_ENGINE = "com.example.service.action.UPDATE_ENGINE"
+        const val ACTION_RESET_ENGINE = "com.example.service.action.RESET_ENGINE"
     }
 }
 

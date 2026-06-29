@@ -320,7 +320,8 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
                     onClearLogs = { viewModel.clearLogs() },
                     onManualPoll = { viewModel.manuallyPoll() },
                     onRestoreNetworkSimulation = { viewModel.simulateNetworkRestore() },
-                    onUpdateEngine = { viewModel.updateYtDlpEngine() }
+                    onUpdateEngine = { viewModel.updateYtDlpEngine() },
+                    onResetEngine = { viewModel.resetYtDlpEngine() }
                 )
             }
         }
@@ -1713,7 +1714,8 @@ fun LogsTab(
     onClearLogs: () -> Unit,
     onManualPoll: () -> Unit,
     onRestoreNetworkSimulation: () -> Unit,
-    onUpdateEngine: () -> Unit
+    onUpdateEngine: () -> Unit,
+    onResetEngine: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         
@@ -1787,10 +1789,27 @@ fun LogsTab(
                     }
                 }
 
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Button(
+                    onClick = onResetEngine,
+                    colors = ButtonDefaults.buttonColors(containerColor = GlowRed.copy(alpha = 0.15f), contentColor = GlowRed),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(40.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(imageVector = Icons.Default.Delete, contentDescription = "Reset yt-dlp", modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("ROLLBACK / RESET ENGINE", fontSize = 10.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
-                    text = "Click 'MIUI NETWORK RESTORE' to trigger detection of missed streams inside the overnight battery doze outage window. Click 'UPDATE YT-DLP ENGINE' to dynamically check, update and re-sync local decryption binaries to bypass YouTube's client blocks.",
+                    text = "Click 'MIUI NETWORK RESTORE' to trigger detection of missed streams inside the overnight battery doze outage window. Click 'UPDATE YT-DLP ENGINE' to update to Python 3.8-compatible yt-dlp (v2025.01.12) to bypass player client blocks. Click 'ROLLBACK / RESET ENGINE' to restore the highly stable, pre-bundled engine if anything breaks.",
                     color = Color.White.copy(alpha = 0.5f),
                     fontSize = 10.sp,
                     lineHeight = 14.sp
