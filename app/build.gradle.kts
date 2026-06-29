@@ -138,6 +138,6 @@ dependencies {
   "ksp"(libs.moshi.kotlin.codegen)
   
   // Real yt-dlp recorder backend (yausername's Jitpack artifacts)
-  implementation("com.github.yausername.youtubedl-android:library:0.18.1")
-  implementation("com.github.yausername.youtubedl-android:ffmpeg:0.18.1")
+  implementation("com.github.yausername.youtubedl-android:library:0.14.0")
+  implementation("com.github.yausername.youtubedl-android:ffmpeg:0.14.0")
 }
