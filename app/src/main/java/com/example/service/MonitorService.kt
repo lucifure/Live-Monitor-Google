@@ -71,19 +71,20 @@ class MonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds.")
+            )
+        }
+
         if (!isForeground) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds."),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
-            } else {
-                startForeground(
-                    NOTIFICATION_ID,
-                    buildNotification("Monitoring YouTube channels...", "Polling active channels every 60 seconds.")
-                )
-            }
             isForeground = true
             
             // Start background polling and checking
