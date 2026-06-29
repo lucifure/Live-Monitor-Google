@@ -693,7 +693,6 @@ class MonitorService : Service() {
             
             // Replicate the highly successful Termux command-line options exactly
             request.addOption("--extractor-args", "youtube:player-client=android_vr")
-            request.addOption("--js-runtime", "quickjs")
             request.addOption("--wait-for-video", "60")
             request.addOption("--live-from-start")
             request.addOption("--hls-use-mpegts")
