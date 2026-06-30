@@ -89,6 +89,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -119,6 +120,7 @@ import java.util.Locale
 
 @Composable
 fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
+    val context = LocalContext.current
     val channels by viewModel.channels.collectAsState()
     val recordings by viewModel.recordings.collectAsState()
     val logs by viewModel.logs.collectAsState()
@@ -321,7 +323,8 @@ fun LiveMonitorAppScreen(viewModel: LiveMonitorViewModel) {
                     onManualPoll = { viewModel.manuallyPoll() },
                     onRestoreNetworkSimulation = { viewModel.simulateNetworkRestore() },
                     onUpdateEngine = { viewModel.updateYtDlpEngine() },
-                    onResetEngine = { viewModel.resetYtDlpEngine() }
+                    onResetEngine = { viewModel.resetYtDlpEngine() },
+                    onExportLogs = { viewModel.exportAndShareLogs(context) }
                 )
             }
         }
@@ -1715,7 +1718,8 @@ fun LogsTab(
     onManualPoll: () -> Unit,
     onRestoreNetworkSimulation: () -> Unit,
     onUpdateEngine: () -> Unit,
-    onResetEngine: () -> Unit
+    onResetEngine: () -> Unit,
+    onExportLogs: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         
@@ -1833,17 +1837,34 @@ fun LogsTab(
                 fontFamily = FontFamily.Monospace
             )
 
-            Text(
-                text = "CLEAR ALL",
-                color = GlowRed,
-                fontWeight = FontWeight.Bold,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(4.dp))
-                    .clickable { onClearLogs() }
-                    .padding(horizontal = 6.dp, vertical = 4.dp)
-            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SAVE/EXPORT (.TXT)",
+                    color = CyberGreen,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .clickable { onExportLogs() }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                )
+
+                Text(
+                    text = "CLEAR ALL",
+                    color = GlowRed,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .clickable { onClearLogs() }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                )
+            }
         }
 
         // Terminal style list

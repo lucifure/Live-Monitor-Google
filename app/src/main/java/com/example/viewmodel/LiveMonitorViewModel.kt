@@ -87,8 +87,8 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
                     // Seed standard channels
                     repository.insertChannel(
                         MonitoredChannel(
-                            name = "Darth MB (Retro Live)",
-                            handle = "@darth_mb",
+                            name = "Ungraduate Gamer Live",
+                            handle = "@ungraduategamer",
                             status = "MONITORING"
                         )
                     )
@@ -96,11 +96,26 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
                         MonitoredChannel(
                             name = "Lofi Girl Live",
                             handle = "@lofigirl",
-                            status = "PAUSED"
+                            status = "MONITORING"
                         )
                     )
                 }
                 sharedPrefs.edit().putBoolean("channels_seeded", true).apply()
+            } else {
+                // Ensure @ungraduategamer is present and active even on secondary launches
+                val list = repository.allChannels.first()
+                if (list.none { it.handle.equals("@ungraduategamer", ignoreCase = true) }) {
+                    repository.insertChannel(
+                        MonitoredChannel(
+                            name = "Ungraduate Gamer Live",
+                            handle = "@ungraduategamer",
+                            status = "MONITORING"
+                        )
+                    )
+                    repository.logInfo("Proactively added Ungraduate Gamer Live (@ungraduategamer) stream.")
+                    // Trigger poll check
+                    manuallyPoll()
+                }
             }
         }
     }
@@ -241,6 +256,119 @@ class LiveMonitorViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             repository.clearLogs()
             repository.logInfo("Logs cleared.")
+        }
+    }
+
+    fun exportAndShareLogs(context: Context) {
+        viewModelScope.launch {
+            try {
+                repository.logInfo("Initiating detailed diagnostics log export...")
+                
+                val logsContent = withContext(Dispatchers.IO) {
+                    val stringBuilder = StringBuilder()
+                    stringBuilder.append("==================================================\n")
+                    stringBuilder.append("       LIVE MONITOR DIAGNOSTIC TELEMETRY REPORT   \n")
+                    stringBuilder.append("==================================================\n")
+                    stringBuilder.append("Export Time: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())}\n")
+                    stringBuilder.append("Device Manufacturer: ${android.os.Build.MANUFACTURER}\n")
+                    stringBuilder.append("Device Model       : ${android.os.Build.MODEL}\n")
+                    stringBuilder.append("Android Version    : ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})\n")
+                    stringBuilder.append("Application ID     : ${context.packageName}\n")
+                    stringBuilder.append("==================================================\n\n")
+
+                    // 1. App State summary
+                    stringBuilder.append("--- [1] APP DATABASE SUMMARY ---\n")
+                    val allRecs = repository.allRecordings.first()
+                    val allChs = repository.allChannels.first()
+                    stringBuilder.append("Tracked Channels: ${allChs.size}\n")
+                    allChs.forEach { ch ->
+                        stringBuilder.append("  - [ID: ${ch.id}] Name: '${ch.name}', Handle: '${ch.handle}', Status: ${ch.status}, Last Stream Checked: ${ch.lastChecked}, Last Detected: ${ch.lastStreamDetected}\n")
+                    }
+                    stringBuilder.append("\nRecorded Items: ${allRecs.size}\n")
+                    allRecs.forEach { rec ->
+                        stringBuilder.append("  - [ID: ${rec.id}] ChannelID: ${rec.channelId}, Title: '${rec.streamTitle}', Client: '${rec.playerClient}', Status: ${rec.status}, Size: ${rec.fileSize}, Progress: ${rec.progress}, FilePath: '${rec.filePath}', Error: '${rec.errorMessage ?: "None"}'\n")
+                    }
+                    stringBuilder.append("\n==================================================\n\n")
+
+                    // 2. Database Logs
+                    stringBuilder.append("--- [2] DATABASE DIAGNOSTIC ENTRIES ---\n")
+                    val dbLogs = repository.allLogs.first()
+                    if (dbLogs.isEmpty()) {
+                        stringBuilder.append("(No logs in database)\n")
+                    } else {
+                        dbLogs.forEach { log ->
+                            stringBuilder.append("[${log.timestamp}] [${log.level}] ${log.message}\n")
+                        }
+                    }
+                    stringBuilder.append("\n==================================================\n\n")
+
+                    // 3. Programmatic Logcat dump
+                    stringBuilder.append("--- [3] SYSTEM LOGCAT DUMP (KEYWORDS FILTERED) ---\n")
+                    try {
+                        val logcatProcess = Runtime.getRuntime().exec("logcat -d")
+                        val reader = java.io.BufferedReader(java.io.InputStreamReader(logcatProcess.inputStream))
+                        var line: String?
+                        var count = 0
+                        // Keep up to 1500 matching lines to avoid memory blowup
+                        while (reader.readLine().also { line = it } != null && count < 1500) {
+                            val l = line ?: continue
+                            if (l.contains("MonitorService", ignoreCase = true) ||
+                                l.contains("YoutubeDL", ignoreCase = true) ||
+                                l.contains("youtubedl", ignoreCase = true) ||
+                                l.contains("FFmpeg", ignoreCase = true) ||
+                                l.contains("com.example", ignoreCase = true) ||
+                                l.contains("hls_downloader", ignoreCase = true) ||
+                                l.contains("AndroidRuntime", ignoreCase = true) ||
+                                l.contains("FATAL EXCEPTION", ignoreCase = true)
+                            ) {
+                                stringBuilder.append(l).append("\n")
+                                count++
+                            }
+                        }
+                        if (count == 0) {
+                            stringBuilder.append("(No filtered logcat entries found. Ensure logcat read permission or app has logged activity.)\n")
+                        } else {
+                            stringBuilder.append("Total logcat matching lines retrieved: $count\n")
+                        }
+                    } catch (le: Exception) {
+                        stringBuilder.append("Error trying to run program logcat command: ${le.message}\n")
+                        android.util.Log.e("LiveMonitorViewModel", "Error running logcat -d", le)
+                    }
+
+                    stringBuilder.append("\n==================================================\n")
+                    stringBuilder.append("                 END OF DIAGNOSTIC REPORT         \n")
+                    stringBuilder.append("==================================================\n")
+                    stringBuilder.toString()
+                }
+
+                // Write report to cache directory
+                val cacheFile = withContext(Dispatchers.IO) {
+                    val file = java.io.File(context.cacheDir, "live_monitor_diagnostic_logs.txt")
+                    file.writeText(logsContent)
+                    file
+                }
+
+                // Share file via standard Intent
+                val authority = "${context.packageName}.fileprovider"
+                val fileUri: android.net.Uri = androidx.core.content.FileProvider.getUriForFile(context, authority, cacheFile)
+
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "Live Monitor Diagnostics Log")
+                    putExtra(Intent.EXTRA_STREAM, fileUri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+
+                // Launch chooser
+                val chooser = Intent.createChooser(shareIntent, "Save or Send Diagnostic Log .txt")
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(chooser)
+                
+                repository.logInfo("Diagnostic logs exported successfully! Share sheet opened.")
+            } catch (e: Exception) {
+                repository.logError("Export failed: ${e.message}")
+                android.util.Log.e("LiveMonitorViewModel", "Logs export failed", e)
+            }
         }
     }
 

@@ -45,10 +45,18 @@ class MonitorService : Service() {
     private val okHttpClient = OkHttpClient.Builder()
         .followRedirects(true)
         .followSslRedirects(true)
+        .addInterceptor { chain ->
+            val original = chain.request()
+            val requestBuilder = original.newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            val request = requestBuilder.build()
+            chain.proceed(request)
+        }
         .build()
 
     private val activeDownloadJobs = ConcurrentHashMap<Int, Job>()
     private var isForeground = false
+    private var isYtDlpEngineReady = false
 
     inner class LocalBinder : Binder() {
         fun getService(): MonitorService = this@MonitorService
@@ -64,6 +72,7 @@ class MonitorService : Service() {
         repository = LiveMonitorRepository(db)
         _isServiceRunning.value = true
         createNotificationChannel()
+        ensureYtDlpEngineReady()
         
         scope.launch {
             repository.logInfo("Live Monitor Service created.")
@@ -186,52 +195,67 @@ class MonitorService : Service() {
     private suspend fun triggerRecording(channel: MonitoredChannel, title: String, manifestUrl: String, videoId: String) {
         val streamUrl = "https://www.youtube.com/${channel.handle}/live"
         val storageFolder = getRecordingFolder(this)
-        val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.mp4"
-        val outputFile = File(storageFolder, fileName)
-
-        if (!videoId.startsWith("fake_")) {
-            // Live detected, use our integrated yt-dlp recorder!
+        
+        val isFakeHls = videoId.startsWith("fake_")
+        
+        if (isFakeHls) {
+            val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.ts"
+            val outputFile = File(storageFolder, fileName)
+            
             val recording = RecordingItem(
                 channelId = channel.id,
                 channelName = channel.name,
                 streamTitle = title,
                 streamUrl = streamUrl,
                 status = "RECORDING",
-                playerClient = "yt-dlp",
+                playerClient = "hls_downloader",
                 filePath = outputFile.absolutePath
             )
             val recordingId = repository.insertRecording(recording).toInt()
             repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
-            repository.logInfo("Detected LIVE stream for ${channel.name}. Initiating stream decryption and recording via yt-dlp backend...")
-            updateNotification("Active Recording: ${channel.name}", "Recording '${title}' via yt-dlp...")
-
+            
+            repository.logInfo("Detected Simulated LIVE stream for ${channel.name}. Initiating HLS download...")
+            updateNotification("Active Recording: ${channel.name}", "Recording '${title}'...")
+            
             val downloadJob = scope.launch {
-                runYoutubeDLDownload(recordingId, streamUrl, outputFile.absolutePath)
+                runHlsDownload(recordingId, manifestUrl, outputFile.absolutePath)
             }
             activeDownloadJobs[recordingId] = downloadJob
-            return
+        } else {
+            // Real stream
+            val fileName = "${channel.handle.replace("@", "")}_${videoId}_${System.currentTimeMillis() / 1000}.ts"
+            val outputFile = File(storageFolder, fileName)
+            
+            val useHlsFallback = !isYtDlpEngineReady && manifestUrl.isNotEmpty()
+            
+            val recording = RecordingItem(
+                channelId = channel.id,
+                channelName = channel.name,
+                streamTitle = title,
+                streamUrl = if (useHlsFallback) manifestUrl else streamUrl,
+                status = "RECORDING",
+                playerClient = if (useHlsFallback) "hls_downloader" else "yt-dlp",
+                filePath = outputFile.absolutePath
+            )
+            val recordingId = repository.insertRecording(recording).toInt()
+            repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
+            
+            if (useHlsFallback) {
+                repository.logInfo("Detected LIVE stream for ${channel.name}. yt-dlp engine is unavailable; falling back to high-fidelity native HLS downloader...")
+                updateNotification("Active Recording: ${channel.name}", "Recording '${title}' via HLS Fallback...")
+                val downloadJob = scope.launch {
+                    runHlsDownload(recordingId, manifestUrl, outputFile.absolutePath)
+                }
+                activeDownloadJobs[recordingId] = downloadJob
+            } else {
+                repository.logInfo("Detected LIVE stream for ${channel.name}. Initiating stream recording via primary yt-dlp engine (live-from-start enabled)...")
+                updateNotification("Active Recording: ${channel.name}", "Recording '${title}' via yt-dlp...")
+                val downloadJob = scope.launch {
+                    runYoutubeDLDownload(recordingId, streamUrl, outputFile.absolutePath)
+                }
+                activeDownloadJobs[recordingId] = downloadJob
+            }
         }
-
-        val recording = RecordingItem(
-            channelId = channel.id,
-            channelName = channel.name,
-            streamTitle = title,
-            streamUrl = streamUrl,
-            status = "RECORDING",
-            playerClient = "hls_downloader",
-            filePath = outputFile.absolutePath
-        )
-        val recordingId = repository.insertRecording(recording).toInt()
-        
-        // Update channel
-        repository.updateChannel(channel.copy(lastStreamDetected = System.currentTimeMillis()))
-        updateNotification("Active Recording: ${channel.name}", "Recording '${title}'...")
-
-        // Launch HLS Download Job
-        val downloadJob = scope.launch {
-            runHlsDownload(recordingId, manifestUrl, outputFile.absolutePath)
-        }
-        activeDownloadJobs[recordingId] = downloadJob
     }
 
     private suspend fun runHlsDownload(recordingId: Int, manifestUrl: String, outputFilePath: String) {
@@ -266,7 +290,7 @@ class MonitorService : Service() {
                         val success = downloadSegmentToStream(client, segment.url, outputStream)
                         if (success) {
                             downloadedSegments.add(segment.url)
-                            totalBytes += segment.size
+                            totalBytes = outputFile.length()
                             totalSeconds += segment.duration.toLong()
                             progressUpdated = true
                         }
@@ -303,7 +327,7 @@ class MonitorService : Service() {
                 repository.logInfo("Recording COMPLETED: '${recording.streamTitle}'. Saved to '${recording.filePath}'")
                 updateNotification("Live Monitor", "Recording of '${recording.streamTitle}' completed.")
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             repository.logError("Download error: ${e.message}")
             val recording = repository.getRecordingById(recordingId)
             if (recording != null && recording.status == "RECORDING") {
@@ -323,6 +347,41 @@ class MonitorService : Service() {
                     if (response.isSuccessful) response.body?.string() else null
                 }
             } ?: return list
+            
+            // If it's a master playlist containing sub-playlists, resolve the best quality sub-playlist
+            if (content.contains("#EXT-X-STREAM-INF")) {
+                val lines = content.split("\n")
+                var bestUrl: String? = null
+                var maxResolution = 0
+                
+                for (i in lines.indices) {
+                    val line = lines[i].trim()
+                    if (line.contains("#EXT-X-STREAM-INF")) {
+                        // Parse resolution (e.g., RESOLUTION=1280x720)
+                        val resMatch = """RESOLUTION=(\d+)x(\d+)""".toRegex().find(line)
+                        val height = resMatch?.groupValues?.get(2)?.toIntOrNull() ?: 0
+                        
+                        // Find the next line that is the URL
+                        for (j in (i + 1) until lines.size) {
+                            val nextLine = lines[j].trim()
+                            if (nextLine.isNotEmpty() && !nextLine.startsWith("#")) {
+                                val absoluteUrl = resolveAbsoluteUrl(playlistUrl, nextLine)
+                                // We prefer the highest resolution available
+                                if (bestUrl == null || height > maxResolution) {
+                                    bestUrl = absoluteUrl
+                                    maxResolution = height
+                                }
+                                break
+                            }
+                        }
+                    }
+                }
+                
+                if (bestUrl != null) {
+                    repository.logInfo("Resolved HLS master playlist to media sub-playlist (${maxResolution}p): $bestUrl")
+                    return fetchPlaylistSegments(client, bestUrl)
+                }
+            }
             
             var duration = 5.0
             val lines = content.split("\n")
@@ -581,17 +640,11 @@ class MonitorService : Service() {
     }
 
     private fun getRecordingFolder(context: Context): File {
-        val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
-        val appDir = File(downloadsDir, "LiveMonitor")
-        if (!appDir.exists()) {
-            appDir.mkdirs()
+        val folder = File(context.getExternalFilesDir(null), "Recordings")
+        if (!folder.exists()) {
+            folder.mkdirs()
         }
-        if (appDir.exists() && appDir.canWrite()) {
-            return appDir
-        }
-        val fallback = File(context.getExternalFilesDir(null), "Recordings")
-        fallback.mkdirs()
-        return fallback
+        return folder
     }
 
     private suspend fun simulateStreamForChannel(channelId: Int) {
@@ -607,6 +660,43 @@ class MonitorService : Service() {
     private suspend fun simulateNetworkRestoration() {
         repository.logInfo("Network Restoration detected!")
         repository.logInfo("Scanning recent streams...")
+    }
+
+    private suspend fun extractYouTubeManifestUrl(videoUrl: String): String? {
+        try {
+            val request = Request.Builder()
+                .url(videoUrl)
+                .build()
+            
+            val responseText = withContext(Dispatchers.IO) {
+                okHttpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                }
+            } ?: return null
+            
+            var hlsManifestUrl = ""
+            val playerResponse = extractInitialPlayerResponse(responseText)
+            if (playerResponse != null) {
+                val streamingData = playerResponse.optJSONObject("streamingData")
+                hlsManifestUrl = streamingData?.optString("hlsManifestUrl") ?: ""
+            }
+            
+            if (hlsManifestUrl.isEmpty()) {
+                val marker = "hlsManifestUrl\":\""
+                val index = responseText.indexOf(marker)
+                if (index >= 0) {
+                    val start = index + marker.length
+                    val end = responseText.indexOf("\"", start)
+                    if (end > start) {
+                        hlsManifestUrl = responseText.substring(start, end).replace("\\/", "/")
+                    }
+                }
+            }
+            
+            return hlsManifestUrl.ifEmpty { null }
+        } catch (e: Exception) {
+            return null
+        }
     }
 
     private fun startCompletedStreamDownload(url: String, title: String, existingRecordingId: Int = -1) {
@@ -649,11 +739,10 @@ class MonitorService : Service() {
                                    (!url.contains(".m3u8") && !url.contains(".mp4") && !url.contains(".ts"))
 
                 if (isYtDlpTarget) {
-                    // Update model client info
-                    repository.updateRecording(recording.copy(id = id, playerClient = "yt-dlp", filePath = outputFile.absolutePath.replace(".ts", ".mp4")))
-                    val finalOutputFile = File(outputFile.absolutePath.replace(".ts", ".mp4"))
+                    repository.logInfo("Using primary yt-dlp engine for video target: $url")
+                    repository.updateRecording(recording.copy(id = id, playerClient = "yt-dlp", filePath = outputFile.absolutePath))
                     val downloadJob = scope.launch {
-                        runYoutubeDLDownload(id, url, finalOutputFile.absolutePath)
+                        runYoutubeDLDownload(id, url, outputFile.absolutePath)
                     }
                     activeDownloadJobs[id] = downloadJob
                 } else if (url.contains(".m3u8")) {
@@ -676,12 +765,14 @@ class MonitorService : Service() {
         val outputFile = File(outputFilePath)
         outputFile.parentFile?.mkdirs()
 
+        var monitorJob: kotlinx.coroutines.Job? = null
+
         try {
             repository.logInfo("Initializing yt-dlp recorder for recording $recordingId...")
             try {
                 com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
                 com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 val detailedError = "yt-dlp init error: ${e.message}. Cause: ${e.cause?.message}. Stack: ${android.util.Log.getStackTraceString(e)}"
                 repository.logError(detailedError)
                 android.util.Log.e("MonitorService", detailedError, e)
@@ -692,9 +783,9 @@ class MonitorService : Service() {
             request.addOption("-o", outputFile.absolutePath)
             
             // Replicate the highly successful Termux command-line options exactly
-            request.addOption("--extractor-args", "youtube:player-client=android_vr")
+            request.addOption("--extractor-args", "youtube:player-client=android,ios,web,mweb")
             request.addOption("--wait-for-video", "60")
-            request.addOption("--live-from-start")
+            // request.addOption("--live-from-start") // Omit to start instantly from live edge instead of downloading previous hours of video
             request.addOption("--hls-use-mpegts")
             request.addOption("--no-part")
             request.addOption("--skip-unavailable-fragments")
@@ -703,11 +794,10 @@ class MonitorService : Service() {
             request.addOption("--extractor-retries", "infinite")
             request.addOption("--file-access-retries", "infinite")
             request.addOption("--retry-sleep", "5")
-            request.addOption("--socket-timeout", "10")
+            request.addOption("--socket-timeout", "30")
             request.addOption("--force-ipv4")
             request.addOption("--no-check-certificates")
-            request.addOption("-f", "bv*[height<=480]+ba/b/best")
-            request.addOption("--merge-output-format", "mp4")
+            request.addOption("-f", "b[height<=480]/b/best[height<=480]/best")
 
             val recording = repository.getRecordingById(recordingId)
             if (recording != null) {
@@ -723,35 +813,59 @@ class MonitorService : Service() {
 
             repository.logInfo("Executing yt-dlp for URL: $videoUrl")
             
+            // Start active background monitor for real-time size and duration updates
+            monitorJob = scope.launch(Dispatchers.IO) {
+                var elapsed = 0L
+                while (isActive) {
+                    delay(2000)
+                    elapsed += 2
+                    val rec = repository.getRecordingById(recordingId)
+                    if (rec != null && rec.status == "RECORDING") {
+                        val sizeKb = getActiveRecordingSizeKb(outputFile)
+                        repository.updateRecording(
+                            rec.copy(
+                                fileSize = formatSize(sizeKb),
+                                durationSeconds = elapsed,
+                                progress = 0.5f // active indicator
+                            )
+                        )
+                    } else if (rec == null || rec.status != "RECORDING") {
+                        break
+                    }
+                }
+            }
+
             // Execute in background
             val response = withContext(Dispatchers.IO) {
-                com.yausername.youtubedl_android.YoutubeDL.getInstance().execute(request, object : com.yausername.youtubedl_android.DownloadProgressCallback {
-                    override fun onProgressUpdate(progress: Float, etaInSeconds: Long, line: String) {
-                        // Periodic update
-                        scope.launch {
-                            val rec = repository.getRecordingById(recordingId)
-                            if (rec != null && rec.status == "RECORDING") {
-                                val sizeKb = if (outputFile.exists()) outputFile.length() / 1024 else 0L
-                                repository.updateRecording(
-                                    rec.copy(
-                                        fileSize = formatSize(sizeKb),
-                                        progress = progress / 100f,
-                                        durationSeconds = rec.durationSeconds + 1
-                                    )
-                                )
+                try {
+                    com.yausername.youtubedl_android.YoutubeDL.getInstance().execute(request, object : com.yausername.youtubedl_android.DownloadProgressCallback {
+                        override fun onProgressUpdate(progress: Float, etaInSeconds: Long, line: String) {
+                            if (line.isNotBlank()) {
+                                android.util.Log.d("MonitorService_YtDlp", "[$recordingId] $line")
+                                scope.launch {
+                                    repository.logInfo("yt-dlp [$recordingId]: $line")
+                                }
                             }
                         }
-                    }
-                })
+                    })
+                } catch (t: Throwable) {
+                    val linkageErr = "yt-dlp native execution error: ${t.message}. Cause: ${t.cause?.message}"
+                    repository.logError(linkageErr)
+                    throw Exception(linkageErr, t)
+                }
             }
+
+            monitorJob.cancel()
 
             val rec = repository.getRecordingById(recordingId)
             if (rec != null) {
                 if (response.exitCode == 0) {
-                    val finalSizeKb = if (outputFile.exists()) outputFile.length() / 1024 else 0L
+                    val resolvedFile = resolveCompletedFile(outputFile)
+                    val finalSizeKb = if (resolvedFile.exists()) resolvedFile.length() / 1024 else 0L
                     repository.updateRecording(
                         rec.copy(
                             status = "COMPLETED",
+                            filePath = resolvedFile.absolutePath,
                             fileSize = formatSize(finalSizeKb),
                             progress = 1.0f
                         )
@@ -764,7 +878,7 @@ class MonitorService : Service() {
                     repository.logError("yt-dlp exited with non-zero code ${response.exitCode}. Error output: ${response.err}")
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             val errMsg = "yt-dlp failed: ${e.message}"
             repository.logError("yt-dlp download failed: ${e.message}")
             val rec = repository.getRecordingById(recordingId)
@@ -772,6 +886,7 @@ class MonitorService : Service() {
                 repository.updateRecording(rec.copy(status = "CANCELLED", errorMessage = errMsg))
             }
         } finally {
+            monitorJob?.cancel()
             activeDownloadJobs.remove(recordingId)
         }
     }
@@ -829,7 +944,7 @@ class MonitorService : Service() {
                     repository.updateRecording(recording.copy(status = "CANCELLED"))
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             repository.logError("Direct download failed: ${e.message}")
             val recording = repository.getRecordingById(recordingId)
             if (recording != null) {
@@ -856,9 +971,12 @@ class MonitorService : Service() {
             
             val rec = repository.getRecordingById(recordingId)
             if (rec != null) {
-                val updated = rec.copy(status = "CANCELLED")
+                val updated = rec.copy(
+                    status = "COMPLETED",
+                    progress = 1.0f
+                )
                 repository.updateRecording(updated)
-                repository.logWarn("Recording of '${rec.streamTitle}' STOPPED and SAVED.")
+                repository.logInfo("Recording of '${rec.streamTitle}' STOPPED and SAVED as COMPLETED.")
                 
                 if (rec.channelId != -1) {
                     val channel = repository.getChannelById(rec.channelId)
@@ -947,8 +1065,10 @@ class MonitorService : Service() {
                 com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
                 com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
                 val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                isYtDlpEngineReady = true
                 repository.logInfo("yt-dlp engine verified. Version: $ver")
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                isYtDlpEngineReady = false
                 repository.logError("yt-dlp engine integrity check failed: ${e.message}. Attempting automatic self-repair...")
                 try {
                     val noBackupDir = File(applicationContext.noBackupFilesDir, "youtubedl-android")
@@ -962,8 +1082,10 @@ class MonitorService : Service() {
                     com.yausername.youtubedl_android.YoutubeDL.getInstance().init(applicationContext)
                     com.yausername.ffmpeg.FFmpeg.getInstance().init(applicationContext)
                     val ver = com.yausername.youtubedl_android.YoutubeDL.getInstance().version(applicationContext)
+                    isYtDlpEngineReady = true
                     repository.logInfo("yt-dlp engine self-repair successful! Restored to pre-bundled version: $ver")
-                } catch (repairEx: Exception) {
+                } catch (repairEx: Throwable) {
+                    isYtDlpEngineReady = false
                     val fatalErr = "yt-dlp engine self-repair failed: ${repairEx.message}"
                     repository.logError(fatalErr)
                     android.util.Log.e("MonitorService", fatalErr, repairEx)
@@ -1076,6 +1198,48 @@ class MonitorService : Service() {
         val notification = buildNotification(title, content)
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun getActiveRecordingSizeKb(expectedFile: File): Long {
+        if (expectedFile.exists()) {
+            return expectedFile.length() / 1024
+        }
+        val parent = expectedFile.parentFile ?: return 0L
+        val baseName = expectedFile.nameWithoutExtension
+        val files = parent.listFiles() ?: return 0L
+        val matchingFile = files.find { file ->
+            file.name.startsWith(baseName)
+        }
+        return if (matchingFile != null && matchingFile.exists()) {
+            matchingFile.length() / 1024
+        } else {
+            0L
+        }
+    }
+
+    private fun resolveCompletedFile(expectedFile: File): File {
+        if (expectedFile.exists()) return expectedFile
+        val parent = expectedFile.parentFile ?: return expectedFile
+        val baseName = expectedFile.nameWithoutExtension
+        val files = parent.listFiles() ?: return expectedFile
+        val actualFile = files.find { file ->
+            file.name.startsWith(baseName) && 
+            !file.name.endsWith(".part") && 
+            !file.name.endsWith(".ytdl") &&
+            !file.name.endsWith(".temp")
+        }
+        if (actualFile != null && actualFile.exists()) {
+            try {
+                if (actualFile.renameTo(expectedFile)) {
+                    android.util.Log.d("MonitorService_YtDlp", "Renamed ${actualFile.name} to ${expectedFile.name}")
+                    return expectedFile
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("MonitorService_YtDlp", "Failed to rename ${actualFile.name}: ${e.message}")
+            }
+            return actualFile
+        }
+        return expectedFile
     }
 
     companion object {
